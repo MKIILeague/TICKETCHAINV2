@@ -2,6 +2,7 @@ import { StrictMode, Component } from 'react'
 import { createRoot } from 'react-dom/client'
 import { PrivyProvider } from '@privy-io/react-auth'
 import { defineChain } from 'viem'
+import { sepolia } from 'viem/chains'
 import './index.css'
 import App from './App.jsx'
 
@@ -79,8 +80,8 @@ createRoot(document.getElementById('root')).render(
           embeddedWallets: {
             createOnLogin: 'all-users',
           },
-          defaultChain: hardhatChain,
-          supportedChains: [hardhatChain],
+          defaultChain: sepolia,
+          supportedChains: [sepolia],
           appearance: {
             theme: 'dark',
             accentColor: '#6366f1',
