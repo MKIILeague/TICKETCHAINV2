@@ -196,7 +196,13 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
       const startBlock = chainId === 11155111 ? START_BLOCK : 0;
 
       const filter = contract.filters.TicketMinted();
-      const logs = await contract.queryFilter(filter, startBlock);
+      let logs = [];
+      try {
+        logs = await contract.queryFilter(filter, startBlock);
+      } catch (queryErr) {
+        console.warn("Query from startBlock failed, trying block 0:", queryErr);
+        logs = await contract.queryFilter(filter, 0);
+      }
 
       const ticketList = (await Promise.all(logs.map(async (log) => {
         try {

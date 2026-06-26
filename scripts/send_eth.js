@@ -31,7 +31,7 @@ async function main() {
     process.exit(1);
   }
 
-  const amountInEther = "0.0025"; // Plenty for dozen minting txs
+  const amountInEther = process.argv[3] || "0.0025";
   console.log(`⏳ Transferring ${amountInEther} Sepolia ETH to ${recipient}...`);
   
   const tx = await wallet.sendTransaction({

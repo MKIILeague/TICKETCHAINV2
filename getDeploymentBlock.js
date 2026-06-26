@@ -3,7 +3,7 @@ import dotenv from "dotenv";
 dotenv.config();
 
 async function main() {
-  const contractAddress = "0x8C1A9cdB6E1C1F2767e41C11A5a725be8B7cC97f";
+  const contractAddress = "0x881F6A6Ae4ABdfb5a16cDC56f83fe9DF86F57374";
   const rpcUrl = process.env.SEPOLIA_RPC_URL;
   if (!rpcUrl) {
     console.error("Missing SEPOLIA_RPC_URL");
