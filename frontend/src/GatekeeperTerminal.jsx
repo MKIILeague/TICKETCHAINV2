@@ -5,6 +5,7 @@ import {
   Smartphone, Camera, User, Ticket as TicketIcon
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
+import { Scanner } from '@yudiel/react-qr-scanner';
 import { CONTRACT_ADDRESS, CONTRACT_ABI, getContractAddress } from "./constants";
 import { fetchEventStatusByName, isSaleBlocked, EVENT_STATUS } from "./eventStatus";
 
@@ -14,10 +15,12 @@ const GatekeeperTerminal = ({ walletAddress, wallet, connectWallet }) => {
   const [loading, setLoading] = useState(false);
   const [scanStatus, setScanStatus] = useState("IDLE"); // IDLE, VALID, INVALID, CONSUMED, EVENT_BLOCKED
   const [eventStatus, setEventStatus] = useState(null);  // canceled | finished when EVENT_BLOCKED
+  const [isScanning, setIsScanning] = useState(false);
 
-  const handleScan = async (e) => {
-    e.preventDefault();
-    if (!tokenId || !wallet) return;
+  const handleScan = async (e, overrideTokenId = null) => {
+    if (e) e.preventDefault();
+    const targetId = overrideTokenId || tokenId;
+    if (!targetId || !wallet) return;
 
     setLoading(true);
     setScanStatus("IDLE");
@@ -38,11 +41,11 @@ const GatekeeperTerminal = ({ walletAddress, wallet, connectWallet }) => {
       const contractAddress = getContractAddress(targetChainId);
       const contract = new ethers.Contract(contractAddress, CONTRACT_ABI, provider);
       
-      const details = await contract.getTicketDetails(tokenId);
-      const owner = await contract.ownerOf(tokenId);
+      const details = await contract.getTicketDetails(targetId);
+      const owner = await contract.ownerOf(targetId);
 
       setTicketDetails({
-        id: tokenId,
+        id: targetId,
         eventName: details.eventName,
         isUsed: details.isUsed,
         owner: owner
@@ -140,6 +143,41 @@ const GatekeeperTerminal = ({ walletAddress, wallet, connectWallet }) => {
         
         {/* Scanner Field */}
         <section className="bg-[#1e2538] p-8 rounded-[32px] border border-slate-800 shadow-2xl">
+          
+          <div className="mb-6 flex justify-center">
+            <button
+              onClick={() => setIsScanning(!isScanning)}
+              className={`w-full py-4 rounded-2xl font-black text-sm uppercase tracking-widest transition-all flex items-center justify-center gap-2 border-2 ${
+                isScanning ? 'bg-red-500/10 text-red-400 border-red-500/20 hover:bg-red-500/20' : 'bg-indigo-500/10 text-indigo-400 border-indigo-500/20 hover:bg-indigo-500/20'
+              }`}
+            >
+              <Camera size={20} /> {isScanning ? "Stop Camera" : "Start Camera Scanner"}
+            </button>
+          </div>
+
+          {isScanning && (
+            <div className="mb-8 rounded-2xl overflow-hidden border-2 border-indigo-500/30">
+              <Scanner
+                onScan={(result) => {
+                  if (result && result.length > 0 && result[0].rawValue) {
+                    try {
+                      const data = JSON.parse(result[0].rawValue);
+                      if (data.tokenId) {
+                        setIsScanning(false);
+                        setTokenId(data.tokenId);
+                        handleScan(null, data.tokenId);
+                      }
+                    } catch (err) {
+                      console.error("Invalid QR code:", err);
+                    }
+                  }
+                }}
+                onError={(error) => console.log(error?.message)}
+                formats={['qr_code']}
+              />
+            </div>
+          )}
+
           <form onSubmit={handleScan} className="space-y-6">
             <div className="space-y-2">
               <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest ml-1">Manual Ledger Entry</label>
@@ -148,10 +186,9 @@ const GatekeeperTerminal = ({ walletAddress, wallet, connectWallet }) => {
                   type="number" 
                   value={tokenId} 
                   onChange={(e) => setTokenId(e.target.value)} 
-                  placeholder="Scan or Type Token ID..." 
+                  placeholder="Type Token ID..." 
                   className="w-full bg-[#0b0f19] border-2 border-slate-800 rounded-2xl py-5 px-6 text-2xl font-black text-white focus:border-indigo-500 outline-none transition-all placeholder-slate-800"
                 />
-                <Camera className="absolute right-5 top-5 text-slate-700" size={28} />
               </div>
             </div>
             <button 

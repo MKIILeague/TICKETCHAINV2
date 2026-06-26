@@ -12,6 +12,7 @@
   "dependencies": {
     "@privy-io/react-auth": "^3.28.0",
     "@tailwindcss/postcss": "^4.3.0",
+    "@yudiel/react-qr-scanner": "^2.6.0",
     "autoprefixer": "^10.5.0",
     "ethers": "^6.16.0",
     "firebase": "^12.15.0",
