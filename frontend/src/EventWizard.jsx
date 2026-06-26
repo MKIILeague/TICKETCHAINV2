@@ -279,9 +279,28 @@ export default function EventWizard({ wallet, walletAddress, orgData, isPaused, 
         await contract.batchMintTickets.staticCall(walletAddress, tokenURI, priceInWei, form.headline.trim(), quantity);
       } catch (pf) {
         console.warn("[publish] mint preflight (non-blocking):", pf?.reason || pf?.shortMessage || pf?.message);
+        if (pf?.reason?.includes("Not a whitelisted organizer") || pf?.message?.includes("Not a whitelisted organizer")) {
+          alert("❌ Your wallet is not yet whitelisted on the smart contract.\n\nPlease wait for an admin to approve and whitelist your wallet address.");
+          setPhase("idle");
+          return;
+        }
       }
 
-      const gasLimit = 150000n + 320000n * BigInt(quantity);
+      let gasLimit;
+      try {
+        const est = await contract.batchMintTickets.estimateGas(walletAddress, tokenURI, priceInWei, form.headline.trim(), quantity);
+        gasLimit = (est * 120n) / 100n; // 20% buffer
+      } catch (err) {
+        console.warn("[publish] gas estimation failed, using fallback:", err);
+        gasLimit = 200000n + 150000n * BigInt(quantity);
+      }
+
+      if (gasLimit > 29000000n) {
+        alert("❌ Too many tickets for a single transaction! The network gas limit would be exceeded.\n\nPlease deploy your event with a smaller total ticket quantity (e.g. max 100-150 tickets at a time).");
+        setPhase("idle");
+        return;
+      }
+
       const tx = await contract.batchMintTickets(walletAddress, tokenURI, priceInWei, form.headline.trim(), quantity, { gasLimit });
       const receipt = await tx.wait();
 
