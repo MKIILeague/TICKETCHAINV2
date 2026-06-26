@@ -1,0 +1,1022 @@
+import React, { useState, useEffect } from "react";
+import { useLocation } from "react-router-dom";
+import { ethers } from "ethers";
+import {
+  Wallet, Send, Tag, Search, Compass, MapPin,
+  Clock, RefreshCw, Copy, Check, ExternalLink, QrCode, Info,
+  Ticket, ShieldCheck, ArrowRight, Zap, X, Ban, CheckCircle2
+} from "lucide-react";
+import { motion, AnimatePresence } from "framer-motion";
+import { CONTRACT_ADDRESS, CONTRACT_ABI, PUBLIC_RPC_URL, START_BLOCK, getContractAddress } from "./constants";
+import {
+  EVENT_STATUS, normalizeEventName, isTransferFrozen, fetchPublicEventStatusMap
+} from "./eventStatus";
+import EventsHappening, { formatEventWindow } from "./EventsHappening";
+import { QRCodeSVG } from "qrcode.react";
+
+const USD_PER_ETH = 3500; // rough display-only conversion for the subtle/mainstream framing
+const usd = (eth) =>
+  `$${(parseFloat(eth || 0) * USD_PER_ETH).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
+const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) => {
+  const location = useLocation();
+  // Post-purchase confirmation passed from the checkout page (router state).
+  const [purchaseBanner, setPurchaseBanner] = useState(location.state?.purchased || null);
+
+  const [tickets, setTickets] = useState([]);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [isPaused, setIsPaused] = useState(false);
+
+  // Resale flow states
+  const [resaleTicket, setResaleTicket] = useState(null);
+  const [resalePriceInput, setResalePriceInput] = useState("");
+
+  // Transfer flow states
+  const [transferTicket, setTransferTicket] = useState(null);
+  const [recipientAddress, setRecipientAddress] = useState("");
+
+  // Wallet specific states
+  const [ethBalance, setEthBalance] = useState("0.00");
+  const [isFetchingBalance, setIsFetchingBalance] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [showReceiveModal, setShowReceiveModal] = useState(false);
+
+  // Send ETH flow states
+  const [showSendModal, setShowSendModal] = useState(false);
+  const [sendRecipient, setSendRecipient] = useState("");
+  const [sendAmount, setSendAmount] = useState("");
+  const [isSendingEth, setIsSendingEth] = useState(false);
+  const [activeChainId, setActiveChainId] = useState(11155111);
+  const [localhostFaucetLoading, setLocalhostFaucetLoading] = useState(false);
+  const [ticketBalance, setTicketBalance] = useState(0); // ERC-721 balanceOf — authoritative owned count
+
+  // Firestore event-status overlay (name -> { status }). Used to badge/freeze
+  // canceled events and archive finished ones. Legacy on-chain events with no
+  // Firestore doc default to "published" (active).
+  const [eventStatusMap, setEventStatusMap] = useState({});
+  const statusFor = (title) => eventStatusMap[normalizeEventName(title)]?.status || EVENT_STATUS.PUBLISHED;
+
+  const handleLocalhostFaucet = async () => {
+    if (!walletAddress) return;
+    try {
+      setLocalhostFaucetLoading(true);
+      const localProvider = new ethers.JsonRpcProvider("http://127.0.0.1:8545");
+      const localSigner = new ethers.Wallet(
+        "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+        localProvider
+      );
+
+      const tx = await localSigner.sendTransaction({
+        to: walletAddress,
+        value: ethers.parseEther("10.0")
+      });
+
+      addNotification("Localhost ETH transaction sent. Waiting for block confirmation...", "info");
+      await tx.wait();
+      addNotification("Received 10.0 Localhost ETH! Your wallet is now funded.", "success");
+      fetchDashboardData();
+    } catch (err) {
+      console.error("Localhost faucet failed:", err);
+      addNotification("Faucet failed. Ensure your local Hardhat node is running on http://127.0.0.1:8545.", "error");
+    } finally {
+      setLocalhostFaucetLoading(false);
+    }
+  };
+
+  const addNotification = (msg, type = "info") => {
+    alert(`[${type.toUpperCase()}] ${msg}`);
+  };
+
+  const handleCopyAddress = () => {
+    if (!walletAddress) return;
+    navigator.clipboard.writeText(walletAddress);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  const onSendEth = async (toAddress, amount) => {
+    if (!wallet) return;
+    setIsSendingEth(true);
+    try {
+      const eip1193Provider = await wallet.getEthereumProvider();
+      const provider = new ethers.BrowserProvider(eip1193Provider);
+      const signer = await provider.getSigner();
+
+      const tx = await signer.sendTransaction({
+        to: toAddress,
+        value: ethers.parseEther(amount.toString())
+      });
+      await tx.wait();
+      addNotification("ETH sent successfully!", "success");
+      setShowSendModal(false);
+      setSendRecipient("");
+      setSendAmount("");
+      fetchDashboardData();
+    } catch (error) {
+      console.error("Send ETH failed:", error);
+      addNotification(error.reason || "Transaction failed", "error");
+    } finally {
+      setIsSendingEth(false);
+    }
+  };
+
+  const fetchDashboardData = async () => {
+    try {
+      let provider;
+      let chainId = 11155111; // default Sepolia
+
+      if (wallet) {
+        try {
+          const eip1193Provider = await wallet.getEthereumProvider();
+          provider = new ethers.BrowserProvider(eip1193Provider);
+          const network = await provider.getNetwork();
+          chainId = Number(network.chainId);
+        } catch (providerErr) {
+          console.warn("Wallet provider connection failed, falling back to public RPC:", providerErr);
+          provider = null;
+        }
+      }
+
+      // If logged out or wallet provider failed, query public endpoints
+      if (!provider) {
+        const rpcs = [
+          PUBLIC_RPC_URL,
+          "https://sepolia.drpc.org",
+          "https://rpc.ankr.com/eth_sepolia",
+          "https://1rpc.io/sepolia",
+          "https://ethereum-sepolia-rpc.publicnode.com"
+        ];
+
+        for (const url of rpcs) {
+          try {
+            provider = new ethers.JsonRpcProvider(url);
+            const network = await provider.getNetwork();
+            chainId = Number(network.chainId);
+            break; // Successfully connected
+          } catch (rpcErr) {
+            console.warn(`Fallback RPC ${url} connection failed:`, rpcErr);
+            provider = null;
+          }
+        }
+      }
+
+      if (!provider) {
+        console.error("All RPC connections failed. Cannot fetch dashboard data.");
+        return;
+      }
+
+      setActiveChainId(chainId);
+      const contractAddress = getContractAddress(chainId);
+      const contract = new ethers.Contract(contractAddress, CONTRACT_ABI, provider);
+
+      const paused = await contract.paused();
+      setIsPaused(paused);
+
+      // Fetch balance if walletAddress exists
+      if (walletAddress) {
+        setIsFetchingBalance(true);
+        try {
+          const bal = await provider.getBalance(walletAddress);
+          setEthBalance(ethers.formatEther(bal));
+        } catch (balErr) {
+          console.error("Error fetching balance:", balErr);
+        } finally {
+          setIsFetchingBalance(false);
+        }
+
+        // ERC-721 owned-ticket count straight from the contract (vault badge).
+        try {
+          const tBal = await contract.balanceOf(walletAddress);
+          setTicketBalance(Number(tBal));
+        } catch (tErr) {
+          console.warn("balanceOf failed:", tErr?.message);
+        }
+      }
+
+      const startBlock = chainId === 11155111 ? START_BLOCK : 0;
+
+      const filter = contract.filters.TicketMinted();
+      const logs = await contract.queryFilter(filter, startBlock);
+
+      const ticketList = (await Promise.all(logs.map(async (log) => {
+        try {
+          const id = log.args[0];
+          const details = await contract.getTicketDetails(id);
+          const owner = await contract.ownerOf(id);
+          const isPrimary = await contract.whitelistedOrganizers(owner);
+
+          return {
+            id: id.toString(),
+            eventTitle: details.eventName || `Ticket #${id}`,
+            mintPrice: parseFloat(ethers.formatEther(details.originalPrice || 0n)),
+            isUsed: details.isUsed || false,
+            isListed: details.isForResale || false,
+            resalePrice: details.resalePrice ? parseFloat(ethers.formatEther(details.resalePrice)) : 0,
+            owner: owner,
+            isPrimary: isPrimary,
+            category: "VIP",
+            imageUri: "https://images.unsplash.com/photo-1540039155732-68473500d6cb?q=80&w=800&auto=format&fit=crop",
+            date: "Oct 24, 2026",
+            venue: "Global Main Stage"
+          };
+        } catch (ticketErr) {
+          console.warn(`Gracefully skipped sync details for ticket ID from log:`, ticketErr);
+          return null; // Skip this specific ticket instead of throwing and crashing the entire dashboard sync
+        }
+      }))).filter(Boolean);
+
+      setTickets(ticketList);
+    } catch (error) {
+      console.error("Dashboard Sync Error:", error);
+    }
+  };
+
+  // Depend on the stable address string, not the `wallet` object (its identity
+  // changes every render, which caused an infinite fetch/abort loop).
+  useEffect(() => {
+    fetchDashboardData();
+  }, [walletAddress]);
+
+  // Pull the Firestore event-status overlay once (and whenever tickets reload).
+  useEffect(() => {
+    fetchPublicEventStatusMap().then(setEventStatusMap).catch(() => {});
+  }, [tickets.length]);
+
+  const onListResale = async (ticketId, price) => {
+    if (!wallet) return;
+    const resaleTarget = tickets.find((t) => t.id === String(ticketId));
+    if (resaleTarget && isTransferFrozen(statusFor(resaleTarget.eventTitle))) {
+      addNotification("This event was canceled — resale and transfers are frozen.", "error");
+      return false;
+    }
+    try {
+      let eip1193Provider = await wallet.getEthereumProvider();
+      let provider = new ethers.BrowserProvider(eip1193Provider);
+
+      const network = await provider.getNetwork();
+      const currentChainId = Number(network.chainId);
+      const targetChainId = (currentChainId === 31337 || currentChainId === 11155111) ? currentChainId : 11155111;
+
+      if (currentChainId !== targetChainId) {
+        await wallet.switchChain(targetChainId);
+        eip1193Provider = await wallet.getEthereumProvider();
+        provider = new ethers.BrowserProvider(eip1193Provider);
+      }
+
+      // Pre-flight gas check
+      const balance = await provider.getBalance(walletAddress);
+      const balanceInEth = parseFloat(ethers.formatEther(balance));
+      const requiredGas = 0.0003;
+
+      if (balanceInEth < requiredGas) {
+        addNotification(`❌ Insufficient funds for gas!\n\nYou currently have ${balanceInEth.toFixed(4)} ETH, but you need at least ${requiredGas} ETH to send this transaction.`, "error");
+        return false;
+      }
+
+      const signer = await provider.getSigner();
+      const contractAddress = getContractAddress(targetChainId);
+      const contract = new ethers.Contract(contractAddress, CONTRACT_ABI, signer);
+      const priceInWei = ethers.parseEther(price.toString());
+      const tx = await contract.listTicketForResale(ticketId, priceInWei);
+      await tx.wait();
+      addNotification("Ticket listed for resale!", "success");
+      fetchDashboardData();
+      return true;
+    } catch (error) {
+      console.error("Resale failed:", error);
+      addNotification(error.reason || error.message || "Transaction failed", "error");
+      return false;
+    }
+  };
+
+  const onCancelResale = async (ticketId) => {
+    if (!wallet) return;
+    try {
+      let eip1193Provider = await wallet.getEthereumProvider();
+      let provider = new ethers.BrowserProvider(eip1193Provider);
+
+      const network = await provider.getNetwork();
+      const currentChainId = Number(network.chainId);
+      const targetChainId = (currentChainId === 31337 || currentChainId === 11155111) ? currentChainId : 11155111;
+
+      if (currentChainId !== targetChainId) {
+        await wallet.switchChain(targetChainId);
+        eip1193Provider = await wallet.getEthereumProvider();
+        provider = new ethers.BrowserProvider(eip1193Provider);
+      }
+
+      // Pre-flight gas check
+      const balance = await provider.getBalance(walletAddress);
+      const balanceInEth = parseFloat(ethers.formatEther(balance));
+      const requiredGas = 0.0003;
+
+      if (balanceInEth < requiredGas) {
+        addNotification(`❌ Insufficient funds for gas!\n\nYou currently have ${balanceInEth.toFixed(4)} ETH, but you need at least ${requiredGas} ETH to send this transaction.`, "error");
+        return;
+      }
+
+      const signer = await provider.getSigner();
+      const contractAddress = getContractAddress(targetChainId);
+      const contract = new ethers.Contract(contractAddress, CONTRACT_ABI, signer);
+      const tx = await contract.cancelResaleListing(ticketId);
+      await tx.wait();
+      addNotification("Listing cancelled", "success");
+      fetchDashboardData();
+    } catch (error) {
+      console.error("Cancel failed:", error);
+      addNotification(error.reason || error.message || "Transaction failed", "error");
+    }
+  };
+
+  const onTransfer = async (ticketId, toAddress) => {
+    if (!wallet) return;
+    const transferTarget = tickets.find((t) => t.id === String(ticketId));
+    if (transferTarget && isTransferFrozen(statusFor(transferTarget.eventTitle))) {
+      addNotification("This event was canceled — transfers are frozen.", "error");
+      return false;
+    }
+    try {
+      let eip1193Provider = await wallet.getEthereumProvider();
+      let provider = new ethers.BrowserProvider(eip1193Provider);
+
+      const network = await provider.getNetwork();
+      const currentChainId = Number(network.chainId);
+      const targetChainId = (currentChainId === 31337 || currentChainId === 11155111) ? currentChainId : 11155111;
+
+      if (currentChainId !== targetChainId) {
+        await wallet.switchChain(targetChainId);
+        eip1193Provider = await wallet.getEthereumProvider();
+        provider = new ethers.BrowserProvider(eip1193Provider);
+      }
+
+      // Pre-flight gas check
+      const balance = await provider.getBalance(walletAddress);
+      const balanceInEth = parseFloat(ethers.formatEther(balance));
+      const requiredGas = 0.0003;
+
+      if (balanceInEth < requiredGas) {
+        addNotification(`❌ Insufficient funds for gas!\n\nYou currently have ${balanceInEth.toFixed(4)} ETH, but you need at least ${requiredGas} ETH to send this transaction.`, "error");
+        return false;
+      }
+
+      const signer = await provider.getSigner();
+      const contractAddress = getContractAddress(targetChainId);
+      const contract = new ethers.Contract(contractAddress, CONTRACT_ABI, signer);
+      const tx = await contract.safeTransferFrom(walletAddress, toAddress, ticketId);
+      await tx.wait();
+      addNotification("Ticket transferred!", "success");
+      fetchDashboardData();
+      return true;
+    } catch (error) {
+      console.error("Transfer failed:", error);
+      addNotification(error.reason || error.message || "Transaction failed", "error");
+      return false;
+    }
+  };
+
+  // "My Tickets" = every token the connected wallet currently owns, EXCEPT an
+  // organizer's own unsold inventory (a primary ticket still listed for sale).
+  // A purchased ticket has isForResale=false, so it shows here even if the buyer
+  // happens to also be a whitelisted organizer (the case that broke before).
+  const myTickets = tickets.filter(
+    (t) => walletAddress && t.owner.toLowerCase() === walletAddress.toLowerCase() && !(t.isPrimary && t.isListed)
+  );
+  const filteredMyTickets = myTickets.filter((t) =>
+    t.eventTitle.toLowerCase().includes(searchQuery.toLowerCase()) ||
+    t.venue.toLowerCase().includes(searchQuery.toLowerCase())
+  );
+
+  const resaleMaxPrice = resaleTicket ? resaleTicket.mintPrice * 1.1 : 0;
+  const priceExceeded = resaleTicket && resalePriceInput !== ""
+    ? parseFloat(resalePriceInput) > resaleMaxPrice
+    : false;
+
+  const networkLabel = activeChainId === 31337 ? "Localhost" : "Sepolia testnet";
+
+  return (
+    <div className="min-h-screen bg-slate-100 text-slate-900">
+
+      {view === "wallet" ? (
+        /* ─────────────────────────── WALLET VIEW ─────────────────────────── */
+        <div className="max-w-7xl mx-auto px-6 sm:px-10 py-12 animate-in fade-in slide-in-from-bottom-4 duration-500">
+
+          {purchaseBanner && (
+            <div className="mb-8 flex items-start gap-3 rounded-2xl border border-emerald-200 bg-emerald-50 px-5 py-4">
+              <CheckCircle2 size={20} className="mt-0.5 shrink-0 text-emerald-600" />
+              <div className="flex-1">
+                <p className="text-sm font-semibold text-emerald-800">
+                  Successfully purchased {purchaseBanner} ticket{purchaseBanner > 1 ? "s" : ""}!
+                </p>
+                <p className="text-sm text-emerald-700">Your secure entry QR codes have been generated.</p>
+              </div>
+              <button onClick={() => setPurchaseBanner(null)} className="p-1 rounded-lg text-emerald-600 hover:bg-emerald-100 transition-colors" aria-label="Dismiss">
+                <X size={18} />
+              </button>
+            </div>
+          )}
+
+          <div className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-4 mb-10">
+            <div>
+              <h1 className="text-3xl font-bold tracking-tight text-slate-900">Your wallet</h1>
+              <p className="text-slate-500 mt-1">Manage your balance and tickets.</p>
+            </div>
+            {!walletAddress && (
+              <button onClick={connectWallet} className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl font-semibold text-sm transition-colors">
+                Connect wallet
+              </button>
+            )}
+          </div>
+
+          {/* Balance + quick actions */}
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-12">
+
+            {/* Balance card */}
+            <div className="lg:col-span-2 relative overflow-hidden rounded-2xl border border-slate-200 bg-gradient-to-br from-indigo-50 to-white p-8 flex flex-col justify-between min-h-[280px]">
+              <div className="flex justify-between items-start">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 bg-indigo-600 rounded-xl flex items-center justify-center text-white">
+                    <Wallet size={20} />
+                  </div>
+                  <div>
+                    <p className="text-sm font-semibold text-slate-900">TicketChain wallet</p>
+                    <p className="text-xs text-slate-500">Embedded · self-custodial</p>
+                  </div>
+                </div>
+                <span className="inline-flex items-center gap-2 rounded-full bg-white border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-600">
+                  <span className={`w-1.5 h-1.5 rounded-full ${activeChainId === 31337 ? "bg-cyan-500" : "bg-emerald-500"}`} />
+                  {networkLabel}
+                </span>
+              </div>
+
+              <div className="my-6">
+                <p className="text-sm text-slate-500 mb-1">Balance</p>
+                <div className="flex items-baseline gap-2 flex-wrap">
+                  <span className="text-5xl font-bold tracking-tight text-slate-900 tabular-nums">
+                    {isFetchingBalance ? (
+                      <span className="inline-block animate-pulse w-28 h-12 bg-slate-200 rounded-lg align-middle" />
+                    ) : (
+                      parseFloat(ethBalance).toFixed(4)
+                    )}
+                  </span>
+                  <span className="text-xl font-semibold text-slate-400">ETH</span>
+                  <button
+                    onClick={fetchDashboardData}
+                    disabled={isFetchingBalance}
+                    className="ml-2 p-2 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-white transition-colors cursor-pointer"
+                    title="Refresh balance"
+                  >
+                    <RefreshCw size={16} className={isFetchingBalance ? "animate-spin" : ""} />
+                  </button>
+                </div>
+                <p className="text-sm text-slate-500 mt-1">≈ {usd(ethBalance)}</p>
+              </div>
+
+              <div className="flex items-center justify-between gap-4 pt-5 border-t border-slate-200">
+                <div className="min-w-0">
+                  <p className="text-xs text-slate-500 mb-0.5">Wallet address</p>
+                  <p className="font-mono text-sm text-slate-700 truncate">
+                    {walletAddress ? walletAddress : "Not connected"}
+                  </p>
+                </div>
+                {walletAddress && (
+                  <button
+                    onClick={handleCopyAddress}
+                    className={`shrink-0 inline-flex items-center gap-2 px-3 py-2 rounded-lg text-xs font-semibold transition-colors ${copied ? "bg-emerald-50 text-emerald-700 border border-emerald-200" : "bg-white text-slate-700 border border-slate-200 hover:bg-slate-50"}`}
+                  >
+                    {copied ? <><Check size={13} /> Copied</> : <><Copy size={13} /> Copy</>}
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {/* Quick actions */}
+            <div className="rounded-2xl border border-slate-200 bg-white p-6 flex flex-col justify-between min-h-[280px]">
+              <div>
+                <h3 className="font-semibold text-slate-900 mb-4">Quick actions</h3>
+                <div className="space-y-3">
+                  <button
+                    onClick={() => setShowSendModal(true)}
+                    disabled={!walletAddress}
+                    className="w-full py-3 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-100 disabled:text-slate-400 text-white rounded-xl font-semibold text-sm flex items-center justify-center gap-2 transition-colors cursor-pointer disabled:cursor-not-allowed"
+                  >
+                    <Send size={15} /> Send ETH
+                  </button>
+                  <button
+                    onClick={() => setShowReceiveModal(true)}
+                    disabled={!walletAddress}
+                    className="w-full py-3 bg-white border border-slate-200 hover:bg-slate-50 disabled:bg-slate-100 disabled:text-slate-400 text-slate-700 rounded-xl font-semibold text-sm flex items-center justify-center gap-2 transition-colors cursor-pointer disabled:cursor-not-allowed"
+                  >
+                    <QrCode size={15} /> Receive
+                  </button>
+                </div>
+              </div>
+
+              <div className="mt-6 pt-5 border-t border-slate-200">
+                {activeChainId === 31337 ? (
+                  <>
+                    <div className="flex gap-2 items-start mb-3">
+                      <Info size={15} className="mt-0.5 shrink-0 text-cyan-600" />
+                      <p className="text-xs text-slate-500 leading-relaxed">
+                        You're on the local node. Fund this wallet with 10 test ETH instantly.
+                      </p>
+                    </div>
+                    <button
+                      onClick={handleLocalhostFaucet}
+                      disabled={localhostFaucetLoading || !walletAddress}
+                      className="w-full py-2.5 bg-cyan-600 hover:bg-cyan-700 disabled:bg-slate-100 disabled:text-slate-400 text-white rounded-lg font-semibold text-sm transition-colors flex items-center justify-center gap-2 cursor-pointer disabled:cursor-not-allowed"
+                    >
+                      {localhostFaucetLoading ? (
+                        <span className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                      ) : "Get 10 test ETH"}
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <div className="flex gap-2 items-start mb-3">
+                      <Info size={15} className="mt-0.5 shrink-0 text-amber-500" />
+                      <p className="text-xs text-slate-500 leading-relaxed">
+                        Need test ETH for gas? Grab free Sepolia ETH from a faucet.
+                      </p>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <a href="https://sepolia-faucet.pk910.de/" target="_blank" rel="noopener noreferrer"
+                        className="py-2 px-3 bg-white border border-slate-200 hover:bg-slate-50 hover:text-indigo-600 text-xs font-semibold text-slate-600 rounded-lg transition-colors flex items-center justify-center gap-1">
+                        PoW faucet <ExternalLink size={11} />
+                      </a>
+                      <a href="https://www.alchemy.com/faucets/ethereum-sepolia" target="_blank" rel="noopener noreferrer"
+                        className="py-2 px-3 bg-white border border-slate-200 hover:bg-slate-50 hover:text-indigo-600 text-xs font-semibold text-slate-600 rounded-lg transition-colors flex items-center justify-center gap-1">
+                        Alchemy <ExternalLink size={11} />
+                      </a>
+                    </div>
+                  </>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* My tickets */}
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6">
+            <div className="flex items-center gap-4">
+              <h2 className="text-xl font-bold text-slate-900">Your tickets</h2>
+              <span className="inline-flex items-center gap-2 rounded-full bg-slate-900 text-white pl-2 pr-3.5 py-1.5 text-sm font-semibold shadow-[0_4px_20px_rgba(79,70,229,0.35)]">
+                <span className="inline-flex items-center justify-center w-6 h-6 rounded-full bg-indigo-500 text-white text-xs font-bold tabular-nums">{ticketBalance}</span>
+                You own {ticketBalance} secure ticket{ticketBalance === 1 ? "" : "s"}
+              </span>
+            </div>
+            <div className="relative w-full sm:max-w-xs">
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={16} />
+              <input
+                type="text"
+                placeholder="Search your tickets"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                className="w-full bg-white border border-slate-200 rounded-xl py-2.5 pl-10 pr-4 text-sm text-slate-900 placeholder:text-slate-400 focus:border-indigo-500 focus:ring-2 focus:ring-indigo-100 outline-none transition-all"
+              />
+            </div>
+          </div>
+
+          {filteredMyTickets.length === 0 ? (
+            <div className="border border-dashed border-slate-300 rounded-2xl p-16 text-center bg-slate-50">
+              <Compass className="w-10 h-10 text-slate-300 mx-auto mb-4" />
+              <p className="text-slate-600 font-semibold">No tickets yet</p>
+              <p className="text-slate-400 text-sm mt-1">Tickets you buy will show up here.</p>
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+              {filteredMyTickets.map(ticket => (
+                <TicketCard
+                  key={ticket.id}
+                  ticket={ticket}
+                  meta={eventStatusMap[normalizeEventName(ticket.eventTitle)]?.ev}
+                  status={statusFor(ticket.eventTitle)}
+                  owner={walletAddress}
+                  contractAddress={getContractAddress(activeChainId)}
+                  chainId={activeChainId}
+                  onResell={() => { setResaleTicket(ticket); setResalePriceInput(""); }}
+                  onTransfer={() => { setTransferTicket(ticket); setRecipientAddress(""); }}
+                  onCancel={() => onCancelResale(ticket.id)}
+                />
+              ))}
+            </div>
+          )}
+        </div>
+      ) : (
+        /* ─────────────────────── MARKETPLACE / LANDING ───────────────────── */
+        <>
+          {/* Hero */}
+          <section className="border-b border-slate-200 bg-gradient-to-b from-indigo-100/70 via-indigo-50/40 to-slate-100">
+            <div className="max-w-7xl mx-auto px-6 sm:px-10 py-16 sm:py-24">
+              <div className="max-w-2xl">
+                <span className="inline-flex items-center gap-2 rounded-full bg-white border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-600 mb-6">
+                  <ShieldCheck size={14} className="text-indigo-600" /> Powered by Ethereum
+                </span>
+                <h1 className="text-4xl sm:text-5xl font-bold tracking-tight text-slate-900 leading-[1.1]">
+                  Tickets you<br className="hidden sm:block" /> actually own.
+                </h1>
+                <p className="mt-5 text-lg text-slate-600 leading-relaxed">
+                  Buy, sell, and transfer event tickets that live on the blockchain — no fakes,
+                  no scalping, and they're always yours.
+                </p>
+                <div className="mt-8 flex flex-wrap items-center gap-3">
+                  <a href="#events" className="inline-flex items-center gap-2 px-6 py-3 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl font-semibold transition-colors">
+                    Browse events <ArrowRight size={17} />
+                  </a>
+                  {!walletAddress && (
+                    <button onClick={connectWallet} className="inline-flex items-center gap-2 px-6 py-3 bg-white border border-slate-200 hover:bg-slate-50 text-slate-700 rounded-xl font-semibold transition-colors">
+                      Connect wallet
+                    </button>
+                  )}
+                </div>
+
+                <div className="mt-12 flex flex-wrap gap-x-8 gap-y-4">
+                  <Feature icon={ShieldCheck} title="Verified on-chain" desc="Every ticket is a unique token" />
+                  <Feature icon={Tag} title="Fair resale" desc="Capped at 110% of face value" />
+                  <Feature icon={Zap} title="Instant transfer" desc="Send to anyone in seconds" />
+                </div>
+              </div>
+            </div>
+          </section>
+
+          {/* Events Happening — Firestore-driven storefront grid */}
+          <EventsHappening />
+        </>
+      )}
+
+      {/* MODALS */}
+      <AnimatePresence>
+        {resaleTicket && (
+          <Modal onClose={() => setResaleTicket(null)} icon={<Tag size={20} />} title="List for resale" subtitle="Anti-scalping cap applies">
+            <p className="text-sm text-slate-600 leading-relaxed">
+              To keep things fair, the price is capped at 110% of the original.
+              Maximum: <span className="font-semibold text-slate-900">{resaleMaxPrice.toFixed(4)} ETH</span>.
+            </p>
+
+            <div>
+              <label className="block text-sm font-medium text-slate-700 mb-1.5">Asking price (ETH)</label>
+              <input
+                type="number"
+                step="0.001"
+                value={resalePriceInput}
+                onChange={(e) => setResalePriceInput(e.target.value)}
+                placeholder="0.00"
+                className={`w-full bg-white border rounded-xl py-3 px-4 text-sm text-slate-900 placeholder:text-slate-400 outline-none transition-all ${priceExceeded ? "border-red-400 focus:ring-2 focus:ring-red-100" : "border-slate-200 focus:border-indigo-500 focus:ring-2 focus:ring-indigo-100"}`}
+              />
+              {priceExceeded && (
+                <p className="text-red-600 text-xs mt-1.5">Above the 110% cap — lower the price to continue.</p>
+              )}
+            </div>
+
+            <div className="flex gap-3">
+              <button
+                onClick={() => setResaleTicket(null)}
+                className="flex-1 py-3 bg-white border border-slate-200 hover:bg-slate-50 text-slate-700 rounded-xl font-semibold text-sm transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => onListResale(resaleTicket.id, resalePriceInput).then(s => s && setResaleTicket(null))}
+                disabled={!resalePriceInput || priceExceeded || isPaused}
+                className="flex-1 py-3 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-100 disabled:text-slate-400 text-white rounded-xl font-semibold text-sm transition-colors"
+              >
+                List ticket
+              </button>
+            </div>
+          </Modal>
+        )}
+
+        {transferTicket && (
+          <Modal onClose={() => setTransferTicket(null)} icon={<Send size={20} />} title="Transfer ticket" subtitle="Send directly to another wallet">
+            <p className="text-sm text-slate-600 leading-relaxed">
+              This sends the ticket to the address below. Transfers are final and can't be undone.
+            </p>
+            <div>
+              <label className="block text-sm font-medium text-slate-700 mb-1.5">Recipient address</label>
+              <input
+                type="text"
+                value={recipientAddress}
+                onChange={(e) => setRecipientAddress(e.target.value)}
+                placeholder="0x…"
+                className="w-full bg-white border border-slate-200 rounded-xl py-3 px-4 text-sm font-mono text-slate-900 placeholder:text-slate-400 outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-100 transition-all"
+              />
+            </div>
+            <div className="flex gap-3">
+              <button
+                onClick={() => setTransferTicket(null)}
+                className="flex-1 py-3 bg-white border border-slate-200 hover:bg-slate-50 text-slate-700 rounded-xl font-semibold text-sm transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => onTransfer(transferTicket.id, recipientAddress).then(s => s && setTransferTicket(null))}
+                disabled={!recipientAddress || isPaused}
+                className="flex-1 py-3 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-100 disabled:text-slate-400 text-white rounded-xl font-semibold text-sm transition-colors"
+              >
+                Transfer
+              </button>
+            </div>
+          </Modal>
+        )}
+
+        {showSendModal && (
+          <Modal onClose={() => setShowSendModal(false)} icon={<Send size={20} />} title="Send ETH" subtitle={networkLabel}>
+            <div>
+              <label className="block text-sm font-medium text-slate-700 mb-1.5">Recipient address</label>
+              <input
+                type="text"
+                value={sendRecipient}
+                onChange={(e) => setSendRecipient(e.target.value)}
+                placeholder="0x…"
+                className="w-full bg-white border border-slate-200 rounded-xl py-3 px-4 text-sm font-mono text-slate-900 placeholder:text-slate-400 outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-100 transition-all"
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-slate-700 mb-1.5">Amount (ETH)</label>
+              <input
+                type="number"
+                step="0.001"
+                min="0"
+                value={sendAmount}
+                onChange={(e) => setSendAmount(e.target.value)}
+                placeholder="0.0"
+                className="w-full bg-white border border-slate-200 rounded-xl py-3 px-4 text-sm text-slate-900 placeholder:text-slate-400 outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-100 transition-all"
+              />
+              <p className="text-xs text-slate-500 mt-1.5 text-right">
+                Available: {parseFloat(ethBalance).toFixed(4)} ETH
+              </p>
+            </div>
+            <div className="flex gap-3">
+              <button
+                onClick={() => setShowSendModal(false)}
+                className="flex-1 py-3 bg-white border border-slate-200 hover:bg-slate-50 text-slate-700 rounded-xl font-semibold text-sm transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => onSendEth(sendRecipient, sendAmount)}
+                disabled={!sendRecipient || !sendAmount || isSendingEth || parseFloat(sendAmount) > parseFloat(ethBalance)}
+                className="flex-1 py-3 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-100 disabled:text-slate-400 text-white rounded-xl font-semibold text-sm transition-colors flex items-center justify-center gap-2 cursor-pointer"
+              >
+                {isSendingEth ? (
+                  <span className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                ) : "Send"}
+              </button>
+            </div>
+          </Modal>
+        )}
+
+        {showReceiveModal && (
+          <Modal onClose={() => setShowReceiveModal(false)} icon={<QrCode size={20} />} title="Receive ETH" subtitle="Scan or copy your address">
+            <div className="flex flex-col items-center">
+              <div className="p-5 bg-white rounded-2xl border border-slate-200 flex items-center justify-center relative">
+                <svg width="168" height="168" viewBox="0 0 29 29" fill="none" className="text-slate-900">
+                  <rect x="0" y="0" width="7" height="7" fill="currentColor" />
+                  <rect x="1" y="1" width="5" height="5" fill="white" />
+                  <rect x="2" y="2" width="3" height="3" fill="currentColor" />
+                  <rect x="22" y="0" width="7" height="7" fill="currentColor" />
+                  <rect x="23" y="1" width="5" height="5" fill="white" />
+                  <rect x="24" y="2" width="3" height="3" fill="currentColor" />
+                  <rect x="0" y="22" width="7" height="7" fill="currentColor" />
+                  <rect x="1" y="23" width="5" height="5" fill="white" />
+                  <rect x="2" y="24" width="3" height="3" fill="currentColor" />
+                  <rect x="9" y="0" width="2" height="1" fill="currentColor" />
+                  <rect x="12" y="0" width="1" height="3" fill="currentColor" />
+                  <rect x="15" y="0" width="3" height="1" fill="currentColor" />
+                  <rect x="20" y="0" width="1" height="2" fill="currentColor" />
+                  <rect x="9" y="2" width="1" height="2" fill="currentColor" />
+                  <rect x="11" y="2" width="3" height="1" fill="currentColor" />
+                  <rect x="17" y="2" width="2" height="2" fill="currentColor" />
+                  <rect x="20" y="3" width="1" height="2" fill="currentColor" />
+                  <rect x="8" y="5" width="2" height="2" fill="currentColor" />
+                  <rect x="12" y="5" width="1" height="1" fill="currentColor" />
+                  <rect x="14" y="4" width="3" height="1" fill="currentColor" />
+                  <rect x="18" y="5" width="2" height="1" fill="currentColor" />
+                  <rect x="21" y="5" width="1" height="3" fill="currentColor" />
+                  <rect x="0" y="9" width="3" height="1" fill="currentColor" />
+                  <rect x="4" y="8" width="1" height="3" fill="currentColor" />
+                  <rect x="7" y="9" width="2" height="2" fill="currentColor" />
+                  <rect x="10" y="9" width="3" height="1" fill="currentColor" />
+                  <rect x="14" y="8" width="2" height="3" fill="currentColor" />
+                  <rect x="17" y="9" width="1" height="1" fill="currentColor" />
+                  <rect x="19" y="8" width="3" height="2" fill="currentColor" />
+                  <rect x="24" y="9" width="2" height="1" fill="currentColor" />
+                  <rect x="27" y="8" width="2" height="3" fill="currentColor" />
+                  <rect x="2" y="13" width="2" height="1" fill="currentColor" />
+                  <rect x="5" y="12" width="1" height="2" fill="currentColor" />
+                  <rect x="8" y="13" width="3" height="2" fill="currentColor" />
+                  <rect x="12" y="12" width="2" height="1" fill="currentColor" />
+                  <rect x="15" y="13" width="1" height="3" fill="currentColor" />
+                  <rect x="18" y="12" width="2" height="1" fill="currentColor" />
+                  <rect x="21" y="13" width="3" height="2" fill="currentColor" />
+                  <rect x="26" y="13" width="1" height="1" fill="currentColor" />
+                  <rect x="0" y="16" width="2" height="3" fill="currentColor" />
+                  <rect x="3" y="17" width="3" height="1" fill="currentColor" />
+                  <rect x="7" y="16" width="1" height="2" fill="currentColor" />
+                  <rect x="10" y="17" width="2" height="1" fill="currentColor" />
+                  <rect x="13" y="16" width="1" height="3" fill="currentColor" />
+                  <rect x="17" y="17" width="3" height="2" fill="currentColor" />
+                  <rect x="21" y="16" width="2" height="1" fill="currentColor" />
+                  <rect x="24" y="17" width="1" height="1" fill="currentColor" />
+                  <rect x="26" y="16" width="3" height="2" fill="currentColor" />
+                  <rect x="8" y="20" width="2" height="1" fill="currentColor" />
+                  <rect x="11" y="20" width="3" height="2" fill="currentColor" />
+                  <rect x="15" y="20" width="1" height="1" fill="currentColor" />
+                  <rect x="17" y="21" width="2" height="1" fill="currentColor" />
+                  <rect x="20" y="20" width="1" height="3" fill="currentColor" />
+                  <rect x="9" y="23" width="3" height="1" fill="currentColor" />
+                  <rect x="14" y="24" width="2" height="1" fill="currentColor" />
+                  <rect x="17" y="23" width="1" height="3" fill="currentColor" />
+                  <rect x="23" y="23" width="2" height="2" fill="currentColor" />
+                  <rect x="26" y="24" width="3" height="1" fill="currentColor" />
+                  <rect x="8" y="26" width="1" height="3" fill="currentColor" />
+                  <rect x="10" y="27" width="3" height="1" fill="currentColor" />
+                  <rect x="15" y="26" width="2" height="2" fill="currentColor" />
+                  <rect x="19" y="27" width="2" height="1" fill="currentColor" />
+                  <rect x="22" y="26" width="1" height="2" fill="currentColor" />
+                  <rect x="25" y="27" width="3" height="1" fill="currentColor" />
+                </svg>
+                <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                  <div className="w-9 h-9 bg-indigo-600 rounded-full flex items-center justify-center border-2 border-white">
+                    <svg width="13" height="20" viewBox="0 0 256 417" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMidYMid">
+                      <g>
+                        <polygon fill="#FFF" points="127.9611 0 125.1661 9.5 125.1661 285.1 127.9611 287.9 255.9222 212.3"></polygon>
+                        <polygon fill="#FFF" points="127.9611 0 0 212.3 127.9611 287.9 127.9611 154.5"></polygon>
+                        <polygon fill="#FFF" points="127.9611 312.1 126.3861 314 126.3861 412.2 127.9611 416.6 255.999 240.4"></polygon>
+                        <polygon fill="#FFF" points="127.9611 416.6 127.9611 312.1 0 240.4"></polygon>
+                        <polygon fill="#FFF" points="127.9611 287.9 255.9222 212.3 127.9611 154.5"></polygon>
+                        <polygon fill="#FFF" points="0 212.3 127.9611 287.9 127.9611 154.5"></polygon>
+                      </g>
+                    </svg>
+                  </div>
+                </div>
+              </div>
+
+              <div className="w-full mt-5 rounded-xl border border-slate-200 bg-slate-50 p-4">
+                <p className="text-xs text-slate-500 mb-1.5">Your address</p>
+                <p className="font-mono text-xs text-slate-900 break-all">{walletAddress}</p>
+                <button
+                  onClick={handleCopyAddress}
+                  className={`mt-3 w-full inline-flex items-center justify-center gap-2 py-2.5 rounded-lg text-sm font-semibold transition-colors ${copied ? "bg-emerald-50 text-emerald-700 border border-emerald-200" : "bg-indigo-600 hover:bg-indigo-700 text-white"}`}
+                >
+                  {copied ? <><Check size={14} /> Copied</> : <><Copy size={14} /> Copy address</>}
+                </button>
+              </div>
+
+              <p className="text-xs text-slate-500 text-center mt-4 leading-relaxed">
+                Send only ETH on the {networkLabel}. Other tokens may be lost.
+              </p>
+            </div>
+          </Modal>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+};
+
+/* ─────────────────────────── Sub-components ─────────────────────────── */
+
+const Feature = ({ icon: Icon, title, desc }) => (
+  <div className="flex items-start gap-3">
+    <div className="w-9 h-9 rounded-lg bg-white border border-slate-200 flex items-center justify-center text-indigo-600 shrink-0">
+      <Icon size={17} />
+    </div>
+    <div>
+      <p className="text-sm font-semibold text-slate-900">{title}</p>
+      <p className="text-xs text-slate-500">{desc}</p>
+    </div>
+  </div>
+);
+
+// Live blockchain status badge for a ticket (dark glass variant).
+const TicketStateBadge = ({ canceled, finished, used }) => {
+  const map = canceled
+    ? { label: "Canceled", cls: "bg-red-500/15 text-red-300 border-red-500/30" }
+    : used
+      ? { label: "Used", cls: "bg-slate-500/15 text-slate-300 border-white/10" }
+      : finished
+        ? { label: "Ended", cls: "bg-slate-500/15 text-slate-300 border-white/10" }
+        : { label: "Valid", cls: "bg-emerald-500/15 text-emerald-300 border-emerald-500/30" };
+  return (
+    <span className={`shrink-0 inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold border ${map.cls}`}>
+      <span className={`w-1.5 h-1.5 rounded-full ${canceled ? "bg-red-400" : used || finished ? "bg-slate-400" : "bg-emerald-400"}`} />
+      {map.label}
+    </span>
+  );
+};
+
+// Premium dark "glassmorphism" ticket card with a secure entry QR packet.
+const TicketCard = ({ ticket, meta, status, owner, contractAddress, chainId, onResell, onTransfer, onCancel }) => {
+  const canceled = status === EVENT_STATUS.CANCELED;
+  const finished = status === EVENT_STATUS.FINISHED;
+  const used = !!ticket.isUsed;
+  const frozen = isTransferFrozen(status);
+
+  const venue = meta?.venue || ticket.venue;
+  const timeLabel = meta?.timestamp ? formatEventWindow(meta.timestamp) : ticket.date;
+
+  // Secure entry packet encoded into the QR: token id + owner + the on-chain
+  // validation anchor (contract address + chain). The gate scanner reads live
+  // chain state for this token, so an offline screenshot can't be replayed.
+  const qrPayload = JSON.stringify({
+    tokenId: ticket.id,
+    owner,
+    contract: contractAddress,
+    chainId,
+    v: 1,
+  });
+
+  return (
+    <motion.div
+      whileHover={{ y: -4 }}
+      className="relative overflow-hidden rounded-2xl border border-white/10 bg-slate-900/90 backdrop-blur-xl p-6 shadow-[0_10px_40px_-10px_rgba(79,70,229,0.55)]"
+    >
+      {/* neon accent glow */}
+      <div className="absolute -top-20 -right-16 w-44 h-44 bg-indigo-500/25 rounded-full blur-3xl pointer-events-none" />
+      <div className="absolute -bottom-20 -left-16 w-44 h-44 bg-fuchsia-500/10 rounded-full blur-3xl pointer-events-none" />
+
+      <div className="relative">
+        {/* Header */}
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <h4 className="text-lg font-bold text-white leading-snug truncate">{ticket.eventTitle}</h4>
+            <div className="mt-2 space-y-1 text-xs text-slate-400">
+              <p className="flex items-center gap-1.5"><MapPin size={12} className="text-indigo-400 shrink-0" /> <span className="truncate">{venue}</span></p>
+              <p className="flex items-center gap-1.5"><Clock size={12} className="text-indigo-400 shrink-0" /> {timeLabel}</p>
+            </div>
+          </div>
+          <TicketStateBadge canceled={canceled} finished={finished} used={used} />
+        </div>
+
+        {/* Secure entry QR */}
+        <div className="mt-5 flex flex-col items-center">
+          <div className={`p-3 bg-white rounded-2xl shadow-inner ${used || canceled ? "opacity-50 grayscale" : ""}`}>
+            <QRCodeSVG value={qrPayload} size={150} level="H" marginSize={1} bgColor="#ffffff" fgColor="#0f172a" />
+          </div>
+          <p className="mt-3 text-[11px] leading-relaxed text-slate-500 text-center max-w-[16rem]">
+            Active connection required for gate validation. Screenshots or offline tokens will be rejected by scanners.
+          </p>
+        </div>
+
+        {/* Token id */}
+        <div className="mt-4 flex items-center justify-between text-xs">
+          <span className="text-slate-500">Token ID</span>
+          <span className="font-mono text-indigo-300">#{ticket.id}</span>
+        </div>
+
+        {/* Actions / state */}
+        <div className="mt-4 pt-4 border-t border-white/10">
+          {used ? (
+            <div className="w-full py-3 bg-white/5 border border-white/10 text-slate-400 rounded-xl text-center font-semibold text-sm">Redeemed at gate</div>
+          ) : canceled ? (
+            <div className="w-full py-3 bg-red-500/10 border border-red-500/30 text-red-300 rounded-xl text-center font-semibold text-sm flex items-center justify-center gap-2">
+              <Ban size={14} /> Event canceled — frozen
+            </div>
+          ) : frozen ? (
+            <div className="w-full py-3 bg-white/5 border border-white/10 text-slate-400 rounded-xl text-center font-semibold text-sm">Trading frozen</div>
+          ) : ticket.isListed ? (
+            <button onClick={onCancel} className="w-full py-3 bg-white/5 border border-white/10 hover:bg-white/10 text-slate-200 rounded-xl font-semibold text-sm flex items-center justify-center gap-2 transition-colors">
+              <RefreshCw size={14} /> Cancel listing
+            </button>
+          ) : (
+            <div className="grid grid-cols-2 gap-3">
+              <button onClick={onResell} className="py-3 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl font-semibold text-sm transition-colors shadow-lg shadow-indigo-500/20">Resell</button>
+              <button onClick={onTransfer} className="py-3 bg-white/5 border border-white/10 hover:bg-white/10 text-slate-200 rounded-xl font-semibold text-sm transition-colors">Transfer</button>
+            </div>
+          )}
+        </div>
+      </div>
+    </motion.div>
+  );
+};
+
+const Modal = ({ children, onClose, icon, title, subtitle }) => (
+  <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-sm flex items-center justify-center p-4 z-[1000]" onClick={onClose}>
+    <motion.div
+      initial={{ scale: 0.96, opacity: 0, y: 12 }}
+      animate={{ scale: 1, opacity: 1, y: 0 }}
+      exit={{ scale: 0.96, opacity: 0, y: 12 }}
+      transition={{ duration: 0.18 }}
+      onClick={(e) => e.stopPropagation()}
+      className="bg-white border border-slate-200 rounded-2xl w-full max-w-md shadow-2xl relative"
+    >
+      <div className="flex items-center gap-3 p-6 border-b border-slate-100">
+        {icon && (
+          <div className="w-10 h-10 rounded-xl bg-indigo-50 text-indigo-600 flex items-center justify-center shrink-0">
+            {icon}
+          </div>
+        )}
+        <div className="min-w-0">
+          {title && <h3 className="text-lg font-semibold text-slate-900 leading-tight">{title}</h3>}
+          {subtitle && <p className="text-sm text-slate-500">{subtitle}</p>}
+        </div>
+        <button onClick={onClose} className="ml-auto p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition-colors">
+          <X size={20} />
+        </button>
+      </div>
+      <div className="p-6 space-y-5">
+        {children}
+      </div>
+    </motion.div>
+  </div>
+);
+
+export default BuyerResellerDashboard;

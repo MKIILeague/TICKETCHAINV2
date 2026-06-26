@@ -1,0 +1,90 @@
+@import "tailwindcss";
+
+/* ─── TicketChain Global Reset & Design Tokens ──────────────────────────── */
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+:root {
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background-color: #f1f5f9; /* slate-100 — soft gray base, not stark white */
+  color: #0f172a; /* slate-900 */
+  font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  min-height: 100vh;
+}
+
+/* Override the scaffolded #root constraint — let it fill the full viewport */
+#root {
+  width: 100%;
+  max-width: 100%;
+  margin: 0;
+  padding: 0;
+  text-align: left;
+  border: none;
+  min-height: 100svh;
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+}
+
+/* ─── Smooth Scroll ─────────────────────────────────────────────────────── */
+html {
+  scroll-behavior: smooth;
+}
+
+/* ─── Custom Scrollbar (light) ──────────────────────────────────────────── */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: #f1f5f9; /* slate-100 */
+}
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1; /* slate-300 */
+  border-radius: 6px;
+  border: 2px solid #f1f5f9;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8; /* slate-400 */
+}
+
+/* ─── Selection colour ──────────────────────────────────────────────────── */
+::selection {
+  background: rgba(79, 70, 229, 0.15); /* indigo-600 @ 15% */
+  color: #1e1b4b;
+}
+
+/* ─── Utility: slow spin for listed ticket cards ────────────────────────── */
+@keyframes spin-slow {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+.animate-spin-slow {
+  animation: spin-slow 3s linear infinite;
+}
+
+/* ─── Utility: fade + slide in (used by dashboards) ────────────────────── */
+@keyframes fadeSlideUp {
+  from { opacity: 0; transform: translateY(16px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.animate-in {
+  animation: fadeSlideUp 0.5s ease forwards;
+}
+.fade-in {
+  animation-name: fadeSlideUp;
+}
+.slide-in-from-bottom-4 {
+  --tw-enter-translate-y: 1rem;
+}
+.duration-500 { animation-duration: 0.5s; }
+.duration-700 { animation-duration: 0.7s; }
