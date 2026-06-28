@@ -1,7 +1,7 @@
 const hre = require("hardhat");
 
 async function main() {
-  const contractAddress = "0x881F6A6Ae4ABdfb5a16cDC56f83fe9DF86F57374";
+  const contractAddress = "0x97bDBebB67720a52365EF08e412182fDCC3Be06E";
   const newOwner = "0x6eE97e0DFdaf29f365Fa82e26B63388f5748f707";
 
   const TicketContract = await hre.ethers.getContractFactory("TicketContract");

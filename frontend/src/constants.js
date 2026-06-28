@@ -7,11 +7,15 @@ import contractJson from "./TicketContract.json";
 // discovers events by querying TicketMinted logs from this block, so a stale
 // value means missing/slow event lists. Update it after each Sepolia deploy.
 // ---------------------------------------------------------------------------
-export const CONTRACT_ADDRESS = "0x881F6A6Ae4ABdfb5a16cDC56f83fe9DF86F57374";
-export const START_BLOCK = 11144309; // exact Sepolia deploy block
+export const CONTRACT_ADDRESS = "0x97bDBebB67720a52365EF08e412182fDCC3Be06E";
+export const START_BLOCK = 11159059; // exact Sepolia deploy block
 
 // Public read-only RPC for Sepolia (used for logged-out / fallback reads).
-export const PUBLIC_RPC_URL = "https://ethereum-sepolia-rpc.publicnode.com";
+// NOTE: must support historical `eth_getLogs` across the deployment's block
+// range. publicnode.com is deliberately NOT used here — it rejects historical
+// log queries ("archive requests require a personal token"), which silently
+// returned zero tickets in "Your tickets". drpc.org serves them fine.
+export const PUBLIC_RPC_URL = "https://sepolia.drpc.org";
 
 // Exporting the exact interface layout definitions
 export const CONTRACT_ABI = contractJson.abi;

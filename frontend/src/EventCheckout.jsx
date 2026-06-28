@@ -142,12 +142,13 @@ export default function EventCheckout({ walletAddress, wallet, connectWallet }) 
       const picks = available.slice(0, qty);
 
       // Funds check: sum of the ticket prices + a per-ticket gas buffer.
+      // Demo mode: transactions execute with zero value, so we only need a gas buffer.
       const sumWei = picks.reduce((acc, p) => acc + p.price, 0n);
       const gasBufferWei = ethers.parseEther((0.0005 * qty).toFixed(6));
-      const need = sumWei + gasBufferWei;
+      const need = gasBufferWei; // Only require gas, not the ticket price
       const balance = await provider.getBalance(walletAddress);
       if (balance < need) {
-        setError(`Insufficient funds. You need ~${parseFloat(ethers.formatEther(need)).toFixed(4)} ETH (tickets + gas) but have ${parseFloat(ethers.formatEther(balance)).toFixed(4)} ETH.`);
+        setError(`Insufficient funds for gas. You need ~${parseFloat(ethers.formatEther(need)).toFixed(4)} ETH to cover network fees but have ${parseFloat(ethers.formatEther(balance)).toFixed(4)} ETH.`);
         setPhase("idle");
         return;
       }
@@ -161,7 +162,7 @@ export default function EventCheckout({ walletAddress, wallet, connectWallet }) 
       // back to per-ticket purchases only if the deployed contract predates it.
       let batchSupported = true;
       try {
-        await contract.batchPurchaseResale.staticCall(ids, { value: sumWei });
+        await contract.batchPurchaseResale.staticCall(ids, { value: 0n });
       } catch (probe) {
         if (probe?.reason) throw probe;   // a real revert reason → surface it
         batchSupported = false;           // function not present on this deployment
@@ -169,14 +170,14 @@ export default function EventCheckout({ walletAddress, wallet, connectWallet }) 
 
       if (batchSupported) {
         setProgress({ current: 0, total: qty });
-        const tx = await contract.batchPurchaseResale(ids, { value: sumWei });
+        const tx = await contract.batchPurchaseResale(ids, { value: 0n });
         await tx.wait();
         purchased = ids.length;
       } else {
         // Legacy fallback: one approval per ticket.
         for (let i = 0; i < picks.length; i++) {
           setProgress({ current: i + 1, total: qty });
-          const tx = await contract.purchaseResaleTicket(picks[i].id, { value: picks[i].price });
+          const tx = await contract.purchaseResaleTicket(picks[i].id, { value: 0n });
           await tx.wait();
           purchased++;
         }

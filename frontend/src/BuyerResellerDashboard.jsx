@@ -18,6 +18,33 @@ const USD_PER_ETH = 3500; // rough display-only conversion for the subtle/mainst
 const usd = (eth) =>
   `$${(parseFloat(eth || 0) * USD_PER_ETH).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 
+// Run an async fn over items with bounded concurrency. Firing 100+ contract
+// reads in parallel gets public RPCs to rate-limit and silently drop responses,
+// which made the owned-count show while every ticket card got dropped. Keeping
+// only a handful in flight at once is reliable.
+async function mapLimit(items, limit, fn) {
+  const results = new Array(items.length);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (cursor < items.length) {
+      const idx = cursor++;
+      results[idx] = await fn(items[idx], idx);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+// Retry a flaky read a few times with backoff (public RPCs occasionally 429).
+async function withRetry(fn, tries = 3) {
+  let lastErr;
+  for (let i = 0; i < tries; i++) {
+    try { return await fn(); }
+    catch (e) { lastErr = e; await new Promise((r) => setTimeout(r, 300 * (i + 1))); }
+  }
+  throw lastErr;
+}
+
 const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) => {
   const location = useLocation();
   // Post-purchase confirmation passed from the checkout page (router state).
@@ -49,6 +76,7 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
   const [activeChainId, setActiveChainId] = useState(11155111);
   const [localhostFaucetLoading, setLocalhostFaucetLoading] = useState(false);
   const [ticketBalance, setTicketBalance] = useState(0); // ERC-721 balanceOf — authoritative owned count
+  const [isLoadingTickets, setIsLoadingTickets] = useState(true);
 
   // Firestore event-status overlay (name -> { status }). Used to badge/freeze
   // canceled events and archive finished ones. Legacy on-chain events with no
@@ -120,97 +148,99 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
     }
   };
 
-  const fetchDashboardData = async () => {
-    try {
-      let provider;
-      let chainId = 11155111; // default Sepolia
+  // Sepolia read RPCs. Public endpoints serve a single `eth_getLogs` fine but
+  // RATE-LIMIT bursts of small calls — firing ownerOf for all ~50 minted tokens
+  // got every read dropped (count showed, no cards). So we discover the wallet's
+  // tokens from Transfer event logs (incoming minus outgoing = 2 cheap log
+  // queries) and fetch getTicketDetails only for the few tokens it owns.
+  const SEPOLIA_READ_RPCS = [
+    PUBLIC_RPC_URL,               // primary (sepolia.drpc.org)
+    "https://1rpc.io/sepolia",    // verified fallback
+    "https://sepolia.drpc.org",
+  ];
 
+  const fetchDashboardData = async () => {
+    setIsLoadingTickets(true);
+    try {
+      // 1) Which chain is the embedded wallet on? (defaults to Sepolia)
+      let chainId = 11155111;
       if (wallet) {
         try {
           const eip1193Provider = await wallet.getEthereumProvider();
-          provider = new ethers.BrowserProvider(eip1193Provider);
-          const network = await provider.getNetwork();
-          chainId = Number(network.chainId);
-        } catch (providerErr) {
-          console.warn("Wallet provider connection failed, falling back to public RPC:", providerErr);
-          provider = null;
+          chainId = Number((await new ethers.BrowserProvider(eip1193Provider).getNetwork()).chainId);
+        } catch (e) {
+          console.warn("Could not read wallet network, defaulting to Sepolia:", e?.message);
         }
       }
+      setActiveChainId(chainId);
+      const contractAddress = getContractAddress(chainId);
+      const startBlock = chainId === 11155111 ? START_BLOCK : 0;
+      const candidates = chainId === 31337 ? ["http://127.0.0.1:8545"] : [...new Set(SEPOLIA_READ_RPCS)];
 
-      // If logged out or wallet provider failed, query public endpoints
-      if (!provider) {
-        const rpcs = [
-          PUBLIC_RPC_URL,
-          "https://sepolia.drpc.org",
-          "https://rpc.ankr.com/eth_sepolia",
-          "https://1rpc.io/sepolia",
-          "https://ethereum-sepolia-rpc.publicnode.com"
-        ];
-
-        for (const url of rpcs) {
-          try {
-            provider = new ethers.JsonRpcProvider(url);
-            const network = await provider.getNetwork();
-            chainId = Number(network.chainId);
-            break; // Successfully connected
-          } catch (rpcErr) {
-            console.warn(`Fallback RPC ${url} connection failed:`, rpcErr);
-            provider = null;
+      // 2) Pick a provider AND read this wallet's Transfer history in one step,
+      //    so the choice is validated by the real query we depend on. incoming =
+      //    tokens transferred TO us (incl. the purchase); outgoing = ones we sent
+      //    away. The set difference is exactly what we currently own.
+      let provider = null, contract = null, incoming = [], outgoing = [];
+      for (const url of candidates) {
+        try {
+          const p = new ethers.JsonRpcProvider(url);
+          const c = new ethers.Contract(contractAddress, CONTRACT_ABI, p);
+          if (walletAddress) {
+            [incoming, outgoing] = await Promise.all([
+              c.queryFilter(c.filters.Transfer(null, walletAddress), startBlock),
+              c.queryFilter(c.filters.Transfer(walletAddress, null), startBlock),
+            ]);
+          } else {
+            await p.getBlockNumber();
           }
+          provider = p; contract = c;
+          break; // this RPC works — reuse it for the rest
+        } catch (e) {
+          console.warn(`Read RPC ${url} failed:`, e?.info?.error?.message || e?.message);
         }
       }
 
       if (!provider) {
-        console.error("All RPC connections failed. Cannot fetch dashboard data.");
+        console.error("No working read RPC. Cannot sync wallet.");
         return;
       }
 
-      setActiveChainId(chainId);
-      const contractAddress = getContractAddress(chainId);
-      const contract = new ethers.Contract(contractAddress, CONTRACT_ABI, provider);
+      setIsPaused(await contract.paused().catch(() => false));
 
-      const paused = await contract.paused();
-      setIsPaused(paused);
-
-      // Fetch balance if walletAddress exists
-      if (walletAddress) {
-        setIsFetchingBalance(true);
-        try {
-          const bal = await provider.getBalance(walletAddress);
-          setEthBalance(ethers.formatEther(bal));
-        } catch (balErr) {
-          console.error("Error fetching balance:", balErr);
-        } finally {
-          setIsFetchingBalance(false);
-        }
-
-        // ERC-721 owned-ticket count straight from the contract (vault badge).
-        try {
-          const tBal = await contract.balanceOf(walletAddress);
-          setTicketBalance(Number(tBal));
-        } catch (tErr) {
-          console.warn("balanceOf failed:", tErr?.message);
-        }
+      // Logged out → nothing to show in "Your tickets".
+      if (!walletAddress) {
+        setTickets([]);
+        return;
       }
 
-      const startBlock = chainId === 11155111 ? START_BLOCK : 0;
-
-      const filter = contract.filters.TicketMinted();
-      let logs = [];
+      // 3) Balance + authoritative owned count.
+      setIsFetchingBalance(true);
       try {
-        logs = await contract.queryFilter(filter, startBlock);
-      } catch (queryErr) {
-        console.warn("Query from startBlock failed, trying block 0:", queryErr);
-        logs = await contract.queryFilter(filter, 0);
+        setEthBalance(ethers.formatEther(await provider.getBalance(walletAddress)));
+      } catch (balErr) {
+        console.error("Error fetching balance:", balErr);
+      } finally {
+        setIsFetchingBalance(false);
+      }
+      try {
+        setTicketBalance(Number(await contract.balanceOf(walletAddress)));
+      } catch (tErr) {
+        console.warn("balanceOf failed:", tErr?.message);
       }
 
-      const ticketList = (await Promise.all(logs.map(async (log) => {
-        try {
-          const id = log.args[0];
-          const details = await contract.getTicketDetails(id);
-          const owner = await contract.ownerOf(id);
-          const isPrimary = await contract.whitelistedOrganizers(owner);
+      // 4) Owned token IDs from Transfer logs (incoming − outgoing).
+      const owned = new Set(incoming.map((l) => l.args[2].toString()));
+      outgoing.forEach((l) => owned.delete(l.args[2].toString()));
+      const ownedIds = [...owned];
 
+      // owner === me for every owned token, so isPrimary is the same for all.
+      const iAmOrganizer = await contract.whitelistedOrganizers(walletAddress).catch(() => false);
+
+      // Details only for the tokens we own (small N, gentle on the RPC + retry).
+      const ticketList = (await mapLimit(ownedIds, 4, async (id) => {
+        try {
+          const details = await withRetry(() => contract.getTicketDetails(id));
           return {
             id: id.toString(),
             eventTitle: details.eventName || `Ticket #${id}`,
@@ -218,22 +248,24 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
             isUsed: details.isUsed || false,
             isListed: details.isForResale || false,
             resalePrice: details.resalePrice ? parseFloat(ethers.formatEther(details.resalePrice)) : 0,
-            owner: owner,
-            isPrimary: isPrimary,
+            owner: walletAddress,
+            isPrimary: iAmOrganizer,
             category: "VIP",
             imageUri: "https://images.unsplash.com/photo-1540039155732-68473500d6cb?q=80&w=800&auto=format&fit=crop",
             date: "Oct 24, 2026",
             venue: "Global Main Stage"
           };
         } catch (ticketErr) {
-          console.warn(`Gracefully skipped sync details for ticket ID from log:`, ticketErr);
-          return null; // Skip this specific ticket instead of throwing and crashing the entire dashboard sync
+          console.warn(`Skipped token #${id}:`, ticketErr?.message);
+          return null;
         }
-      }))).filter(Boolean);
+      })).filter(Boolean);
 
       setTickets(ticketList);
     } catch (error) {
       console.error("Dashboard Sync Error:", error);
+    } finally {
+      setIsLoadingTickets(false);
     }
   };
 
@@ -242,6 +274,16 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
   useEffect(() => {
     fetchDashboardData();
   }, [walletAddress]);
+
+  // Arriving straight from checkout, the public RPC can still be a block or two
+  // behind, so the just-bought ticket may not be visible on the first read.
+  // Re-sync a couple of times after landing so it appears without a manual tap.
+  useEffect(() => {
+    if (!purchaseBanner || !walletAddress) return;
+    const timers = [3000, 8000].map((ms) => setTimeout(() => fetchDashboardData(), ms));
+    return () => timers.forEach(clearTimeout);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [purchaseBanner, walletAddress]);
 
   // Pull the Firestore event-status overlay once (and whenever tickets reload).
   useEffect(() => {
@@ -562,12 +604,21 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
 
           {/* My tickets */}
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6">
-            <div className="flex items-center gap-4">
+            <div className="flex items-center gap-3 flex-wrap">
               <h2 className="text-xl font-bold text-slate-900">Your tickets</h2>
               <span className="inline-flex items-center gap-2 rounded-full bg-slate-900 text-white pl-2 pr-3.5 py-1.5 text-sm font-semibold shadow-[0_4px_20px_rgba(79,70,229,0.35)]">
-                <span className="inline-flex items-center justify-center w-6 h-6 rounded-full bg-indigo-500 text-white text-xs font-bold tabular-nums">{ticketBalance}</span>
-                You own {ticketBalance} secure ticket{ticketBalance === 1 ? "" : "s"}
+                <span className="inline-flex items-center justify-center w-6 h-6 rounded-full bg-indigo-500 text-white text-xs font-bold tabular-nums">{myTickets.length}</span>
+                You own {myTickets.length} secure ticket{myTickets.length === 1 ? "" : "s"}
               </span>
+              <button
+                onClick={fetchDashboardData}
+                disabled={isLoadingTickets}
+                title="Refresh tickets"
+                className="inline-flex items-center gap-1.5 rounded-full bg-white border border-slate-200 hover:bg-slate-50 disabled:opacity-50 text-slate-600 px-3 py-1.5 text-xs font-semibold transition-colors"
+              >
+                <RefreshCw size={13} className={isLoadingTickets ? "animate-spin" : ""} />
+                Refresh
+              </button>
             </div>
             <div className="relative w-full sm:max-w-xs">
               <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={16} />
@@ -581,11 +632,40 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
             </div>
           </div>
 
-          {filteredMyTickets.length === 0 ? (
+          {/* Owned vs. visible mismatch hint (almost always RPC lag right after buying) */}
+          {!isLoadingTickets && ticketBalance > myTickets.length && (
+            <div className="mb-6 flex items-start gap-3 rounded-2xl border border-amber-200 bg-amber-50 px-5 py-4">
+              <Info size={18} className="mt-0.5 shrink-0 text-amber-500" />
+              <div className="flex-1">
+                <p className="text-sm font-semibold text-amber-800">
+                  {ticketBalance - myTickets.length} ticket{ticketBalance - myTickets.length === 1 ? "" : "s"} still syncing
+                </p>
+                <p className="text-sm text-amber-700">The network is catching up after your purchase. Tap refresh in a few seconds.</p>
+              </div>
+              <button onClick={fetchDashboardData} disabled={isLoadingTickets} className="shrink-0 inline-flex items-center gap-1.5 rounded-lg bg-amber-500 hover:bg-amber-600 disabled:opacity-50 text-white px-3 py-2 text-xs font-semibold transition-colors">
+                <RefreshCw size={13} className={isLoadingTickets ? "animate-spin" : ""} /> Refresh
+              </button>
+            </div>
+          )}
+
+          {isLoadingTickets && myTickets.length === 0 ? (
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+              {[0, 1, 2].map((i) => <TicketCardSkeleton key={i} />)}
+            </div>
+          ) : filteredMyTickets.length === 0 ? (
             <div className="border border-dashed border-slate-300 rounded-2xl p-16 text-center bg-slate-50">
               <Compass className="w-10 h-10 text-slate-300 mx-auto mb-4" />
-              <p className="text-slate-600 font-semibold">No tickets yet</p>
-              <p className="text-slate-400 text-sm mt-1">Tickets you buy will show up here.</p>
+              <p className="text-slate-600 font-semibold">
+                {searchQuery ? "No tickets match your search" : "No tickets yet"}
+              </p>
+              <p className="text-slate-400 text-sm mt-1">
+                {searchQuery ? "Try a different event or venue name." : "Tickets you buy will show up here."}
+              </p>
+              {!searchQuery && (
+                <a href="/#events" className="mt-5 inline-flex items-center gap-2 px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl font-semibold text-sm transition-colors">
+                  Browse events <ArrowRight size={16} />
+                </a>
+              )}
             </div>
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
@@ -909,6 +989,24 @@ const TicketStateBadge = ({ canceled, finished, used }) => {
   );
 };
 
+// Loading placeholder that mirrors the dark ticket card's footprint.
+const TicketCardSkeleton = () => (
+  <div className="relative overflow-hidden rounded-2xl border border-white/10 bg-slate-900/90 p-6 animate-pulse">
+    <div className="flex items-start justify-between gap-3">
+      <div className="flex-1 space-y-2">
+        <div className="h-5 w-3/4 bg-white/10 rounded" />
+        <div className="h-3 w-1/2 bg-white/10 rounded" />
+        <div className="h-3 w-2/5 bg-white/10 rounded" />
+      </div>
+      <div className="h-6 w-16 bg-white/10 rounded-full" />
+    </div>
+    <div className="mt-5 flex justify-center">
+      <div className="w-[174px] h-[174px] bg-white/10 rounded-2xl" />
+    </div>
+    <div className="mt-5 h-11 w-full bg-white/10 rounded-xl" />
+  </div>
+);
+
 // Premium dark "glassmorphism" ticket card with a secure entry QR packet.
 const TicketCard = ({ ticket, meta, status, owner, contractAddress, chainId, onResell, onTransfer, onCancel }) => {
   const canceled = status === EVENT_STATUS.CANCELED;
@@ -962,10 +1060,18 @@ const TicketCard = ({ ticket, meta, status, owner, contractAddress, chainId, onR
           </p>
         </div>
 
-        {/* Token id */}
-        <div className="mt-4 flex items-center justify-between text-xs">
-          <span className="text-slate-500">Token ID</span>
-          <span className="font-mono text-indigo-300">#{ticket.id}</span>
+        {/* Face value + token id */}
+        <div className="mt-4 space-y-2 text-xs">
+          <div className="flex items-center justify-between">
+            <span className="text-slate-500">{ticket.isListed ? "Listed for" : "Face value"}</span>
+            <span className="font-semibold text-white">
+              {(ticket.isListed ? ticket.resalePrice : ticket.mintPrice).toFixed(3)} <span className="text-slate-400 font-normal">ETH</span>
+            </span>
+          </div>
+          <div className="flex items-center justify-between">
+            <span className="text-slate-500">Token ID</span>
+            <span className="font-mono text-indigo-300">#{ticket.id}</span>
+          </div>
         </div>
 
         {/* Actions / state */}

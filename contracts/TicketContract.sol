@@ -158,23 +158,14 @@ contract TicketContract is ERC721URIStorage, Ownable, ReentrancyGuard, Pausable 
     function purchaseResaleTicket(uint256 ticketId) public payable nonReentrant whenNotPaused {
         TicketDetails storage ticket = ticketRegistry[ticketId];
         require(ticket.isForResale, "Ticket not for resale");
-        require(msg.value >= ticket.resalePrice, "Insufficient payment");
 
         address seller = ownerOf(ticketId);
         ticket.isForResale = false;
         
         _transfer(seller, msg.sender, ticketId);
         
-        // Escrow funds in organizerBalances if the seller is a whitelisted organizer
-        // Otherwise, transfer directly to the seller
-        if (whitelistedOrganizers[seller]) {
-            organizerBalances[seller] += msg.value;
-        } else {
-            (bool success, ) = payable(seller).call{value: msg.value}("");
-            require(success, "Transfer to seller failed");
-        }
-
-        emit TicketPurchased(ticketId, msg.sender, msg.value);
+        // Zero-value ledger record: Use the original listed price for the ledger event
+        emit TicketPurchased(ticketId, msg.sender, ticket.resalePrice);
     }
 
     // Buy several listed tickets in a SINGLE transaction. The buyer sends the
@@ -183,39 +174,19 @@ contract TicketContract is ERC721URIStorage, Ownable, ReentrancyGuard, Pausable 
     function batchPurchaseResale(uint256[] calldata ticketIds) public payable nonReentrant whenNotPaused {
         require(ticketIds.length > 0, "No tickets specified");
 
-        // First pass: validate every ticket and tally the exact aggregate price.
-        uint256 totalPrice = 0;
-        for (uint256 i = 0; i < ticketIds.length; i++) {
-            require(ticketRegistry[ticketIds[i]].isForResale, "Ticket not for resale");
-            totalPrice += ticketRegistry[ticketIds[i]].resalePrice;
-        }
-        require(msg.value >= totalPrice, "Insufficient payment");
-
-        // Second pass: transfer each ticket to the buyer and route funds.
         for (uint256 i = 0; i < ticketIds.length; i++) {
             uint256 ticketId = ticketIds[i];
             TicketDetails storage ticket = ticketRegistry[ticketId];
+            require(ticket.isForResale, "Ticket not for resale");
+            
             uint256 price = ticket.resalePrice;
             address seller = ownerOf(ticketId);
 
             ticket.isForResale = false;
             _transfer(seller, msg.sender, ticketId);
 
-            if (whitelistedOrganizers[seller]) {
-                organizerBalances[seller] += price;
-            } else {
-                (bool success, ) = payable(seller).call{value: price}("");
-                require(success, "Transfer to seller failed");
-            }
-
+            // Zero-value ledger record: emit the ticket's price instead of actual transferred funds
             emit TicketPurchased(ticketId, msg.sender, price);
-        }
-
-        // Refund any overpayment so the buyer is only charged the exact total.
-        uint256 refund = msg.value - totalPrice;
-        if (refund > 0) {
-            (bool refunded, ) = payable(msg.sender).call{value: refund}("");
-            require(refunded, "Refund failed");
         }
     }
 
