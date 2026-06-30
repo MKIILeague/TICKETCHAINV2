@@ -1,6 +1,6 @@
 import React, { useState } from "react";
 import { BrowserRouter, Routes, Route, Outlet, NavLink, useNavigate } from "react-router-dom";
-import { Ticket as TicketIcon, Wallet, LogIn, LogOut, Building2, Menu, X, User } from "lucide-react";
+import { Ticket as TicketIcon, Wallet, LogIn, LogOut, Building2, Menu, X, User, Repeat } from "lucide-react";
 import { useTicketWallet } from "./useTicketWallet";
 import { useProfile } from "./useProfile";
 import RequireRole from "./RequireRole";
@@ -12,6 +12,7 @@ import GatekeeperTerminal from "./GatekeeperTerminal";
 import SystemAdminConsole from "./SystemAdminConsole";
 import AdminLogin from "./AdminLogin";
 import Profile from "./Profile";
+import ResaleMarketplace from "./ResaleMarketplace";
 
 // ─── Consumer navbar (UX only — real authority is on-chain) ──────────────────
 function Navbar() {
@@ -53,6 +54,9 @@ function Navbar() {
         {/* Desktop Links */}
         <div className="hidden sm:flex items-center gap-1">
           <NavLink to="/" end className={link}>Events</NavLink>
+          <NavLink to="/resale" className={link}>
+            <span className="inline-flex items-center gap-1.5"><Repeat size={14} /> Resale</span>
+          </NavLink>
           <NavLink to="/wallet" className={link}>Wallet</NavLink>
           <NavLink to="/organizer" className={link}>
             <span className="inline-flex items-center gap-1.5"><Building2 size={14} /> Organizer</span>
@@ -89,6 +93,9 @@ function Navbar() {
       {isOpen && (
         <div className="sm:hidden border-t border-slate-200 bg-white px-4 py-4 space-y-2 shadow-lg">
           <NavLink to="/" end onClick={() => setIsOpen(false)} className={mobileLink}>Events</NavLink>
+          <NavLink to="/resale" onClick={() => setIsOpen(false)} className={mobileLink}>
+            <span className="inline-flex items-center gap-1.5"><Repeat size={16} /> Resale</span>
+          </NavLink>
           <NavLink to="/wallet" onClick={() => setIsOpen(false)} className={mobileLink}>Wallet</NavLink>
           {authenticated && (
             <NavLink to="/profile" onClick={() => setIsOpen(false)} className={mobileLink}>
@@ -150,6 +157,10 @@ function WalletPage() {
   const p = useChainProps();
   return <BuyerResellerDashboard {...p} view="wallet" />;
 }
+function ResalePage() {
+  const p = useChainProps();
+  return <ResaleMarketplace {...p} />;
+}
 function EventCheckoutPage() {
   const p = useChainProps();
   return <EventCheckout {...p} />;
@@ -184,6 +195,8 @@ export default function App() {
           {/* Marketplace IS the landing page; viewable while logged out (public RPC) */}
           <Route path="/" element={<MarketplacePage />} />
           <Route path="/event/:eventId" element={<EventCheckoutPage />} />
+          {/* Public per-token resale storefront — viewable logged out via public RPC */}
+          <Route path="/resale" element={<ResalePage />} />
           <Route path="/wallet" element={<RequireRole allow={["buyer"]}><WalletPage /></RequireRole>} />
           <Route path="/profile" element={<RequireRole allow={["buyer"]}><Profile /></RequireRole>} />
           <Route path="/organizer" element={<OrganizerLanding />} />

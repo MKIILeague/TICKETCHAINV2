@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from "react";
-import { useLocation } from "react-router-dom";
+import { useLocation, Link } from "react-router-dom";
 import { ethers } from "ethers";
 import {
   Wallet, Send, Tag, Search, Compass, MapPin,
@@ -1085,9 +1085,16 @@ const TicketCard = ({ ticket, meta, status, owner, contractAddress, chainId, onR
           ) : frozen ? (
             <div className="w-full py-3 bg-white/5 border border-white/10 text-slate-400 rounded-xl text-center font-semibold text-sm">Trading frozen</div>
           ) : ticket.isListed ? (
-            <button onClick={onCancel} className="w-full py-3 bg-white/5 border border-white/10 hover:bg-white/10 text-slate-200 rounded-xl font-semibold text-sm flex items-center justify-center gap-2 transition-colors">
-              <RefreshCw size={14} /> Cancel listing
-            </button>
+            <div className="space-y-2.5">
+              <button onClick={onCancel} className="w-full py-3 bg-white/5 border border-white/10 hover:bg-white/10 text-slate-200 rounded-xl font-semibold text-sm flex items-center justify-center gap-2 transition-colors">
+                <RefreshCw size={14} /> Cancel listing
+              </button>
+              {!ticket.isPrimary && (
+                <Link to="/resale" className="flex items-center justify-center gap-1.5 text-xs font-medium text-indigo-300 hover:text-indigo-200 transition-colors">
+                  View on resale market <ArrowRight size={13} />
+                </Link>
+              )}
+            </div>
           ) : (
             <div className="grid grid-cols-2 gap-3">
               <button onClick={onResell} className="py-3 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl font-semibold text-sm transition-colors shadow-lg shadow-indigo-500/20">Resell</button>
