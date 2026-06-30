@@ -7,8 +7,8 @@ import contractJson from "./TicketContract.json";
 // discovers events by querying TicketMinted logs from this block, so a stale
 // value means missing/slow event lists. Update it after each Sepolia deploy.
 // ---------------------------------------------------------------------------
-export const CONTRACT_ADDRESS = "0x97bDBebB67720a52365EF08e412182fDCC3Be06E";
-export const START_BLOCK = 11159059; // exact Sepolia deploy block
+export const CONTRACT_ADDRESS = "0xF7FE8f5f0699672bac953DC91CE36509CEf79b49";
+export const START_BLOCK = 11170233; // exact Sepolia deploy block
 
 // Public read-only RPC for Sepolia (used for logged-out / fallback reads).
 // NOTE: must support historical `eth_getLogs` across the deployment's block
@@ -25,7 +25,7 @@ export const CONTRACT_ABI = contractJson.abi;
 // - everything else            -> the Sepolia address above
 export function getContractAddress(chainId) {
   if (Number(chainId) === 31337) {
-    return "0x5FbDB2315678afecb367f032d93F642f64180aa3"; // Localhost Hardhat address (auto-set by setupLocal.js, block 1)
+    return "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"; // Localhost Hardhat address (auto-set by setupLocal.js, block 2)
   }
   return CONTRACT_ADDRESS;
 }

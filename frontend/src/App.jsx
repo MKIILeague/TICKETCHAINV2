@@ -1,7 +1,8 @@
 import React, { useState } from "react";
 import { BrowserRouter, Routes, Route, Outlet, NavLink, useNavigate } from "react-router-dom";
-import { Ticket as TicketIcon, Wallet, LogIn, LogOut, Building2, Menu, X } from "lucide-react";
+import { Ticket as TicketIcon, Wallet, LogIn, LogOut, Building2, Menu, X, User } from "lucide-react";
 import { useTicketWallet } from "./useTicketWallet";
+import { useProfile } from "./useProfile";
 import RequireRole from "./RequireRole";
 import BuyerResellerDashboard from "./BuyerResellerDashboard";
 import EventCheckout from "./EventCheckout";
@@ -10,10 +11,12 @@ import OrganizerDashboard from "./OrganizerDashboard";
 import GatekeeperTerminal from "./GatekeeperTerminal";
 import SystemAdminConsole from "./SystemAdminConsole";
 import AdminLogin from "./AdminLogin";
+import Profile from "./Profile";
 
 // ─── Consumer navbar (UX only — real authority is on-chain) ──────────────────
 function Navbar() {
   const { ready, authenticated, address, login, logout, isAdmin, isGatekeeper } = useTicketWallet();
+  const { displayName } = useProfile(address);
   const [isOpen, setIsOpen] = useState(false);
   
   const link = ({ isActive }) =>
@@ -62,10 +65,14 @@ function Navbar() {
         <div className="flex items-center gap-3 shrink-0">
           {ready && authenticated ? (
             <>
-              <span className="hidden md:inline-flex items-center gap-2 text-xs font-medium text-slate-600 bg-slate-100 border border-slate-200 rounded-full px-3 py-1.5">
-                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
-                {address ? `${address.substring(0, 6)}…${address.substring(38)}` : "—"}
-              </span>
+              <NavLink
+                to="/profile"
+                title="View your profile"
+                className="hidden md:inline-flex items-center gap-2 max-w-[180px] text-xs font-medium text-slate-600 bg-slate-100 border border-slate-200 rounded-full px-3 py-1.5 hover:bg-slate-200 hover:text-slate-900 transition-colors"
+              >
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 shrink-0" />
+                <span className="truncate">{displayName}</span>
+              </NavLink>
               <button onClick={logout} className="inline-flex items-center gap-1.5 px-3 py-2 bg-white border border-slate-200 hover:bg-slate-50 text-slate-700 rounded-lg text-sm font-medium transition-colors">
                 <LogOut size={14} /> <span className="hidden sm:inline">Sign out</span>
               </button>
@@ -83,6 +90,11 @@ function Navbar() {
         <div className="sm:hidden border-t border-slate-200 bg-white px-4 py-4 space-y-2 shadow-lg">
           <NavLink to="/" end onClick={() => setIsOpen(false)} className={mobileLink}>Events</NavLink>
           <NavLink to="/wallet" onClick={() => setIsOpen(false)} className={mobileLink}>Wallet</NavLink>
+          {authenticated && (
+            <NavLink to="/profile" onClick={() => setIsOpen(false)} className={mobileLink}>
+              <span className="inline-flex items-center gap-1.5"><User size={16} /> Profile</span>
+            </NavLink>
+          )}
           <NavLink to="/organizer" onClick={() => setIsOpen(false)} className={mobileLink}>
             <span className="inline-flex items-center gap-1.5"><Building2 size={16} /> Organizer</span>
           </NavLink>
@@ -173,6 +185,7 @@ export default function App() {
           <Route path="/" element={<MarketplacePage />} />
           <Route path="/event/:eventId" element={<EventCheckoutPage />} />
           <Route path="/wallet" element={<RequireRole allow={["buyer"]}><WalletPage /></RequireRole>} />
+          <Route path="/profile" element={<RequireRole allow={["buyer"]}><Profile /></RequireRole>} />
           <Route path="/organizer" element={<OrganizerLanding />} />
           <Route path="/organizer/register" element={<RequireRole allow={["buyer"]}><OrganizerRegisterPage /></RequireRole>} />
           <Route path="/organizer/login" element={<RequireRole allow={["buyer"]}><OrganizerLoginPage /></RequireRole>} />
