@@ -4,7 +4,8 @@ import { ethers } from "ethers";
 import {
   Wallet, Send, Tag, Search, Compass, MapPin,
   Clock, RefreshCw, Copy, Check, ExternalLink, QrCode, Info,
-  Ticket, ShieldCheck, ArrowRight, Zap, X, Ban, CheckCircle2
+  Ticket, ShieldCheck, ArrowRight, Zap, X, Ban, CheckCircle2,
+  CalendarClock, AlertTriangle, History
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { CONTRACT_ABI, PUBLIC_RPC_URL, getContractAddress, getDeployments } from "./constants";
@@ -80,6 +81,8 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
   // Firestore doc default to "published" (active).
   const [eventStatusMap, setEventStatusMap] = useState({});
   const statusFor = (title) => eventStatusMap[normalizeEventName(title)]?.status || EVENT_STATUS.PUBLISHED;
+  // Which lifecycle group of "Your tickets" is shown: upcoming | missed | history.
+  const [ticketTab, setTicketTab] = useState("upcoming");
 
   const handleLocalhostFaucet = async () => {
     if (!walletAddress) return;
@@ -487,7 +490,22 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
   const myTickets = tickets.filter(
     (t) => walletAddress && t.owner.toLowerCase() === walletAddress.toLowerCase() && !(t.isPrimary && t.isListed)
   );
-  const filteredMyTickets = myTickets.filter((t) =>
+
+  // Group tickets by lifecycle so buyers can separate what's still valid from
+  // what's done. `statusFor` already resolves a passed event date to FINISHED.
+  //  · upcoming → event still ahead, not scanned  → usable (resell/transfer/entry)
+  //  · missed   → event date passed, never scanned → expired, unused
+  //  · history  → scanned at the gate (attended) OR the event was canceled
+  const ticketGroup = (t) => {
+    if (t.isUsed) return "history";
+    const st = statusFor(t.eventTitle);
+    if (st === EVENT_STATUS.CANCELED) return "history";
+    if (st === EVENT_STATUS.FINISHED) return "missed";
+    return "upcoming";
+  };
+  const ticketBuckets = { upcoming: [], missed: [], history: [] };
+  myTickets.forEach((t) => ticketBuckets[ticketGroup(t)].push(t));
+  const filteredMyTickets = ticketBuckets[ticketTab].filter((t) =>
     t.eventTitle.toLowerCase().includes(searchQuery.toLowerCase()) ||
     t.venue.toLowerCase().includes(searchQuery.toLowerCase())
   );
@@ -690,6 +708,29 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
             </div>
           </div>
 
+          {/* Lifecycle tabs — separate valid tickets from expired/attended ones */}
+          <div className="flex items-center gap-2 mb-6 overflow-x-auto">
+            {[
+              { id: "upcoming", label: "Upcoming", icon: CalendarClock, count: ticketBuckets.upcoming.length },
+              { id: "missed", label: "Missed", icon: AlertTriangle, count: ticketBuckets.missed.length },
+              { id: "history", label: "History", icon: History, count: ticketBuckets.history.length },
+            ].map((tab) => {
+              const activeTab = ticketTab === tab.id;
+              const Icon = tab.icon;
+              return (
+                <button
+                  key={tab.id}
+                  onClick={() => setTicketTab(tab.id)}
+                  className={`inline-flex items-center gap-2 rounded-xl px-4 py-2 text-sm font-semibold border transition-colors whitespace-nowrap ${activeTab ? "bg-slate-900 text-white border-slate-900" : "bg-white text-slate-600 border-slate-200 hover:bg-slate-50"}`}
+                >
+                  <Icon size={15} className={activeTab ? "text-indigo-300" : "text-slate-400"} />
+                  {tab.label}
+                  <span className={`inline-flex items-center justify-center min-w-[20px] h-5 px-1.5 rounded-full text-xs font-bold tabular-nums ${activeTab ? "bg-white/15 text-white" : "bg-slate-100 text-slate-500"}`}>{tab.count}</span>
+                </button>
+              );
+            })}
+          </div>
+
           {/* Owned vs. visible mismatch hint (almost always RPC lag right after buying) */}
           {!isLoadingTickets && ticketBalance > myTickets.length && (
             <div className="mb-6 flex items-start gap-3 rounded-2xl border border-amber-200 bg-amber-50 px-5 py-4">
@@ -714,12 +755,20 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
             <div className="border border-dashed border-slate-300 rounded-2xl p-16 text-center bg-slate-50">
               <Compass className="w-10 h-10 text-slate-300 mx-auto mb-4" />
               <p className="text-slate-600 font-semibold">
-                {searchQuery ? "No tickets match your search" : "No tickets yet"}
+                {searchQuery
+                  ? "No tickets match your search"
+                  : ticketTab === "upcoming" ? "No upcoming tickets"
+                  : ticketTab === "missed" ? "No missed tickets"
+                  : "No ticket history yet"}
               </p>
               <p className="text-slate-400 text-sm mt-1">
-                {searchQuery ? "Try a different event or venue name." : "Tickets you buy will show up here."}
+                {searchQuery
+                  ? "Try a different event or venue name."
+                  : ticketTab === "upcoming" ? "Tickets you buy will show up here until the event ends."
+                  : ticketTab === "missed" ? "Tickets you didn't scan before the event passed will land here."
+                  : "Scanned tickets and canceled events will be archived here."}
               </p>
-              {!searchQuery && (
+              {!searchQuery && ticketTab === "upcoming" && (
                 <a href="/#events" className="mt-5 inline-flex items-center gap-2 px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl font-semibold text-sm transition-colors">
                   Browse events <ArrowRight size={16} />
                 </a>
