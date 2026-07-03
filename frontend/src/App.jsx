@@ -19,6 +19,11 @@ function Navbar() {
   const { ready, authenticated, address, login, logout, isAdmin, isGatekeeper } = useTicketWallet();
   const { displayName } = useProfile(address);
   const [isOpen, setIsOpen] = useState(false);
+
+  // Avatar initial for the profile chip — use the first letter of the display
+  // name when it's an actual name (not a 0x… address), else fall back to an icon.
+  const avatarInitial = (displayName || "").trim().charAt(0);
+  const hasInitial = /[a-zA-Z]/.test(avatarInitial);
   
   const link = ({ isActive }) =>
     `px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
@@ -71,13 +76,16 @@ function Navbar() {
             <>
               <NavLink
                 to="/profile"
-                title="View your profile"
-                className="hidden md:inline-flex items-center gap-2 max-w-[180px] text-xs font-medium text-slate-600 bg-slate-100 border border-slate-200 rounded-full px-3 py-1.5 hover:bg-slate-200 hover:text-slate-900 transition-colors"
+                title="Edit your profile"
+                className="group inline-flex items-center gap-2 max-w-[190px] rounded-full border border-slate-200 bg-slate-100 pl-1 pr-1 md:pr-3 py-1 hover:bg-indigo-50 hover:border-indigo-200 transition-colors"
               >
-                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 shrink-0" />
-                <span className="truncate">{displayName}</span>
+                <span className="relative w-7 h-7 rounded-full bg-gradient-to-br from-indigo-500 to-violet-600 text-white flex items-center justify-center text-xs font-bold shrink-0">
+                  {hasInitial ? avatarInitial.toUpperCase() : <User size={15} />}
+                  <span className="absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full bg-emerald-500 border-2 border-white" />
+                </span>
+                <span className="hidden md:inline truncate text-xs font-medium text-slate-700 group-hover:text-indigo-700">{displayName}</span>
               </NavLink>
-              <button onClick={logout} className="inline-flex items-center gap-1.5 px-3 py-2 bg-white border border-slate-200 hover:bg-slate-50 text-slate-700 rounded-lg text-sm font-medium transition-colors">
+              <button onClick={logout} title="Sign out" className="inline-flex items-center gap-1.5 px-3 py-2 bg-red-50 border border-red-200 hover:bg-red-100 text-red-600 rounded-lg text-sm font-medium transition-colors">
                 <LogOut size={14} /> <span className="hidden sm:inline">Sign out</span>
               </button>
             </>
@@ -99,7 +107,12 @@ function Navbar() {
           <NavLink to="/wallet" onClick={() => setIsOpen(false)} className={mobileLink}>Wallet</NavLink>
           {authenticated && (
             <NavLink to="/profile" onClick={() => setIsOpen(false)} className={mobileLink}>
-              <span className="inline-flex items-center gap-1.5"><User size={16} /> Profile</span>
+              <span className="inline-flex items-center gap-2.5">
+                <span className="w-7 h-7 rounded-full bg-gradient-to-br from-indigo-500 to-violet-600 text-white flex items-center justify-center text-xs font-bold shrink-0">
+                  {hasInitial ? avatarInitial.toUpperCase() : <User size={15} />}
+                </span>
+                Edit profile
+              </span>
             </NavLink>
           )}
           <NavLink to="/organizer" onClick={() => setIsOpen(false)} className={mobileLink}>
