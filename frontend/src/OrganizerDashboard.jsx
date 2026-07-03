@@ -9,7 +9,7 @@ import {
   CalendarPlus, Plus, TrendingUp, BarChart3
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
-import { CONTRACT_ADDRESS, CONTRACT_ABI, START_BLOCK, getContractAddress } from "./constants";
+import { CONTRACT_ABI, PUBLIC_RPC_URL, getContractAddress, getDeployments } from "./constants";
 import { db } from "./firebase";
 import { doc, setDoc, getDoc, deleteDoc, collection, query, where, getDocs } from "firebase/firestore";
 import { fetchOrgStatus, getCachedOrgStatus, setOrgStatusCache } from "./orgStatus";
@@ -338,102 +338,128 @@ const OrganizerDashboard = ({ walletAddress, wallet, connectWallet, logout, mode
   }, [walletAddress]);
 
   const fetchDashboardData = async () => {
-    if (!wallet || !walletAddress) return;
+    if (!walletAddress) return;
+
+    // A) Off-chain events + sold counters FIRST and independently. This powers
+    //    "Active events", "Tickets sold" and the sales pool, so it must NEVER be
+    //    blocked by a flaky on-chain RPC read below (the old order gated it
+    //    behind the log queries — one failure left the overview empty).
     try {
-      const eip1193Provider = await wallet.getEthereumProvider();
-      const provider = new ethers.BrowserProvider(eip1193Provider);
+      const evSnap = await getDocs(query(collection(db, "events"), where("organiserId", "==", walletAddress)));
+      setEventDocs(evSnap.docs.map((d) => d.data()));
+    } catch (evErr) {
+      console.warn("Event docs load failed:", evErr?.message);
+    }
 
-      const network = await provider.getNetwork();
-      const currentChainId = Number(network.chainId);
-      const startBlock = currentChainId === 11155111 ? START_BLOCK : 0;
+    if (!wallet) return;
 
+    // B) On-chain reads — wrapped so any failure here can't wipe the data above.
+    try {
+      const walletProvider = new ethers.BrowserProvider(await wallet.getEthereumProvider());
+      const walletChain = Number((await walletProvider.getNetwork()).chainId);
+      // Sepolia-only in production; local Hardhat honoured only in dev. Also
+      // stops a stray localhost wallet from showing a bogus ~10000-ETH balance.
+      const walletMatches = walletChain === 11155111 || (import.meta.env.DEV && walletChain === 31337);
+      const currentChainId = walletMatches ? walletChain : 11155111;
       setActiveChainId(currentChainId);
-      const contractAddress = getContractAddress(currentChainId);
-      const contract = new ethers.Contract(contractAddress, CONTRACT_ABI, provider);
 
-      const paused = await contract.paused();
-      setIsPaused(paused);
+      // Ordered read providers: the wallet's own RPC first (when it's on our
+      // chain, it has generous eth_getLogs limits), then a public fallback — so a
+      // single flaky endpoint can never strand the balance/data at 0.
+      const readProviders = [];
+      if (walletMatches) readProviders.push(walletProvider);
+      readProviders.push(new ethers.JsonRpcProvider(currentChainId === 31337 ? "http://127.0.0.1:8545" : PUBLIC_RPC_URL));
+      const provider = readProviders[0];
 
-      // Personal wallet balance for the "My Wallet" section
+      // Personal wallet balance for "My Wallet" — try each provider so it can
+      // never strand at 0 just because one endpoint hiccupped.
       setIsFetchingBalance(true);
-      try {
-        const bal = await provider.getBalance(walletAddress);
-        setEthBalance(ethers.formatEther(bal));
-      } catch (balErr) {
-        console.error("Error fetching balance:", balErr);
-      } finally {
-        setIsFetchingBalance(false);
-      }
-
-      const balance = await contract.organizerBalances(walletAddress);
-      setTotalRevenue(ethers.formatEther(balance));
-
-      const filter = contract.filters.TicketMinted(null, walletAddress);
-      const logs = await contract.queryFilter(filter, startBlock);
-
-      let tempVoided = 0;
-      const ticketList = (await Promise.all(logs.map(async (log) => {
+      let gotBalance = false;
+      for (const p of readProviders) {
         try {
-          const id = log.args[0];
-          const details = await contract.getTicketDetails(id);
-          const owner = await contract.ownerOf(id);
-          if (details.isUsed) tempVoided++;
-          return {
-            id: id.toString(),
-            eventTitle: details.eventName || `Ticket #${id}`,
-            mintPrice: ethers.formatEther(details.originalPrice || 0n),
-            isUsed: details.isUsed || false,
-            isListed: details.isForResale || false,
-            owner: owner,
-            category: "VIP"
-          };
-        } catch (ticketErr) {
-          console.warn(`Gracefully skipped sync for organizer ticket:`, ticketErr);
-          return null;
+          setEthBalance(ethers.formatEther(await p.getBalance(walletAddress)));
+          gotBalance = true;
+          break;
+        } catch (balErr) {
+          console.warn("Organizer balance read failed on a provider:", balErr?.message);
         }
-      }))).filter(Boolean);
+      }
+      if (!gotBalance) console.error("All providers failed to return organizer balance.");
+      setIsFetchingBalance(false);
 
-      setTickets(ticketList);
-      setDeployedStock(ticketList.length);
-      setVoidedCount(tempVoided);
+      const deployments = getDeployments(currentChainId);
+      const primaryContract = new ethers.Contract(deployments[0].address, CONTRACT_ABI, provider);
+      setIsPaused(await primaryContract.paused().catch(() => false));
 
-      // Sales timeline — every on-chain TicketPurchased for one of this
-      // organizer's tickets. The event isn't indexed by organizer, so we pull
-      // all purchases from startBlock and keep only the ids we minted above.
+      // Withdrawable on-chain vault (credited only in a real-payment build;
+      // stays 0 in the zero-value demo). Separate from the "sales pool" stat,
+      // which is derived from actual sold counts below.
       try {
-        const titleById = {};
-        ticketList.forEach((t) => { titleById[t.id] = (t.eventTitle || "").split(" #")[0]; });
-        const myIds = new Set(ticketList.map((t) => t.id));
-        const purchaseLogs = await contract.queryFilter(contract.filters.TicketPurchased(), startBlock);
-        const mine = purchaseLogs.filter((l) => myIds.has(l.args[0].toString()));
-        // Resolve block timestamps once per block to limit RPC round-trips.
-        const times = {};
-        await Promise.all([...new Set(mine.map((l) => l.blockNumber))].map(async (bn) => {
-          try { const b = await provider.getBlock(bn); times[bn] = Number(b?.timestamp) || 0; } catch { /* skip */ }
-        }));
-        const series = mine
-          .map((l) => ({
+        setTotalRevenue(ethers.formatEther(await primaryContract.organizerBalances(walletAddress)));
+      } catch { /* leave prior value */ }
+
+      // Scan EVERY deployment for this organizer's mints AND the resulting
+      // purchases, so events/tickets/sales minted on an older contract still
+      // count. TicketPurchased isn't indexed by organizer, so per contract we
+      // keep only purchases of tokens we minted there.
+      let allTickets = [];
+      let allSales = [];
+      for (const dep of deployments) {
+        try {
+          const c = new ethers.Contract(dep.address, CONTRACT_ABI, provider);
+          const mintLogs = await c.queryFilter(c.filters.TicketMinted(null, walletAddress), dep.startBlock);
+          const rows = (await Promise.all(mintLogs.map(async (log) => {
+            try {
+              const id = log.args[0];
+              const details = await c.getTicketDetails(id);
+              const owner = await c.ownerOf(id);
+              return {
+                id: id.toString(),
+                contractAddress: dep.address,
+                eventTitle: details.eventName || `Ticket #${id}`,
+                mintPrice: ethers.formatEther(details.originalPrice || 0n),
+                isUsed: details.isUsed || false,
+                isListed: details.isForResale || false,
+                owner,
+                category: "VIP",
+              };
+            } catch { return null; }
+          }))).filter(Boolean);
+          allTickets = allTickets.concat(rows);
+
+          const idList = rows.map((r) => r.id);
+          const myIds = new Set(idList);
+          const titleById = {};
+          rows.forEach((r) => { titleById[r.id] = (r.eventTitle || "").split(" #")[0]; });
+          // Filter by our token IDs on the INDEXED `ticketId` topic — an
+          // unfiltered TicketPurchased query over the whole range is what public
+          // RPCs reject/truncate (why the graph showed no sales despite a buy).
+          const purchaseLogs = idList.length
+            ? await c.queryFilter(c.filters.TicketPurchased(idList), dep.startBlock)
+            : [];
+          const mine = purchaseLogs.filter((l) => myIds.has(l.args[0].toString()));
+          const times = {};
+          await Promise.all([...new Set(mine.map((l) => l.blockNumber))].map(async (bn) => {
+            try { const b = await provider.getBlock(bn); times[bn] = Number(b?.timestamp) || 0; } catch { /* skip */ }
+          }));
+          mine.forEach((l) => allSales.push({
             id: l.args[0].toString(),
             title: titleById[l.args[0].toString()] || `Ticket #${l.args[0]}`,
             price: parseFloat(ethers.formatEther(l.args[2] || 0n)),
             t: times[l.blockNumber] || 0,
-          }))
-          .sort((a, b) => (a.t - b.t) || (Number(a.id) - Number(b.id)));
-        setSalesSeries(series);
-      } catch (salesErr) {
-        console.warn("Sales timeline load failed:", salesErr?.message);
+          }));
+        } catch (depErr) {
+          console.warn(`Organizer scan of ${dep.address} failed:`, depErr?.message);
+        }
       }
 
-      // Pull the off-chain sold counters in the same refresh so the dashboard's
-      // "sold / total" stays in sync with the storefront and checkout pages.
-      try {
-        const evSnap = await getDocs(query(collection(db, "events"), where("organiserId", "==", walletAddress)));
-        setEventDocs(evSnap.docs.map((d) => d.data()));
-      } catch (evErr) {
-        console.warn("Event docs load failed:", evErr?.message);
-      }
+      setTickets(allTickets);
+      setDeployedStock(allTickets.length);
+      setVoidedCount(allTickets.filter((t) => t.isUsed).length);
+      allSales.sort((a, b) => (a.t - b.t) || (Number(a.id) - Number(b.id)));
+      setSalesSeries(allSales);
     } catch (error) {
-      console.error("Dashboard Sync Error:", error);
+      console.error("Dashboard on-chain sync error:", error);
     }
   };
 
@@ -687,6 +713,35 @@ const OrganizerDashboard = ({ walletAddress, wallet, connectWallet, logout, mode
   const filteredEvents = eventStats.filter((e) => e.title.toLowerCase().includes(searchQuery.toLowerCase()));
   const totalSold = eventStats.reduce((a, e) => a + e.sold, 0);
   const totalMinted = eventStats.reduce((a, e) => a + e.total, 0);
+  // Gross sales value = Σ (tickets sold × face price), computed DIRECTLY from the
+  // Firestore event docs so it's stable: it counts every published event on its
+  // own (eventStats groups by title, so same-titled events would otherwise
+  // collapse and make this jump around when you add events). The on-chain
+  // `organizerBalances` vault stays 0 in the zero-value demo, so this is what we
+  // surface as the "Sales pool".
+  const salesRevenue = eventDocs.reduce((a, e) => {
+    const st = effectiveStatus(e);
+    if (st === EVENT_STATUS.DRAFT || st === EVENT_STATUS.DELETED || !st) return a;
+    return a + (Number(e.sold) || 0) * (parseFloat(e.priceEth) || 0);
+  }, 0);
+
+  // Sales graph data. Prefer real on-chain purchase logs (exact per-sale time),
+  // but if none came back (public RPCs can reject the log query), fall back to
+  // Firestore `sold` counts so the graph still reflects real sales for the demo
+  // — one point per sold ticket, dated by the event.
+  const salesSeriesForChart = useMemo(() => {
+    if (salesSeries.length) return salesSeries;
+    const pts = [];
+    eventDocs.forEach((e) => {
+      const st = effectiveStatus(e);
+      if (st === EVENT_STATUS.DRAFT || st === EVENT_STATUS.DELETED || !st) return;
+      const sold = Number(e.sold) || 0;
+      const price = parseFloat(e.priceEth) || 0;
+      const t = Number(e.timestamp) || Math.floor(Date.parse(e.publishedAt || e.updatedAt || e.createdAt || 0) / 1000) || 0;
+      for (let i = 0; i < sold; i++) pts.push({ id: "", title: (e.headline || "Event").trim(), price, t });
+    });
+    return pts.sort((a, b) => a.t - b.t);
+  }, [salesSeries, eventDocs]);
 
   // Small centered card wrapper used by the organizer auth/status screens.
   const Card = ({ children }) => (
@@ -875,7 +930,7 @@ const OrganizerDashboard = ({ walletAddress, wallet, connectWallet, logout, mode
           {section === "overview" && (
             <div className="space-y-8 max-w-6xl">
               <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
-                <StatCard icon={<DollarSign />} label="Sales pool" value={rm(totalRevenue)} sub={`${ethLabel(totalRevenue, 3)} escrowed`} color="indigo" />
+                <StatCard icon={<DollarSign />} label="Sales pool" value={rm(salesRevenue)} sub={`${ethLabel(salesRevenue, 3)} · ${totalSold} sold`} color="indigo" />
                 <StatCard icon={<TicketIcon />} label="Tickets sold" value={`${totalSold} / ${totalMinted}`} sub="Across all events" color="emerald" />
                 <StatCard icon={<ShieldAlert />} label="Active events" value={`${eventStats.length}`} sub="Published & live" color="amber" />
               </div>
@@ -891,7 +946,7 @@ const OrganizerDashboard = ({ walletAddress, wallet, connectWallet, logout, mode
                     <p className="text-xs text-slate-500">On-chain purchases · price and time per ticket</p>
                   </div>
                 </div>
-                <SalesChart series={salesSeries} />
+                <SalesChart series={salesSeriesForChart} />
               </div>
 
               <div>
@@ -1295,10 +1350,10 @@ const SalesChart = ({ series }) => {
   const W = 640, H = 240, padL = 14, padR = 14, padT = 16, padB = 26;
   const innerW = W - padL - padR, innerH = H - padT - padB;
 
-  let cum = 0;
+  const cumulative = series.reduce((acc, s) => { acc.push((acc[acc.length - 1] || 0) + s.price); return acc; }, []);
   const points = series.map((s, i) => {
-    cum += s.price;
-    return { ...s, i, ticketNo: i + 1, cumRevenue: cum, yVal: metric === "revenue" ? cum : s.price };
+    const cumRevenue = cumulative[i];
+    return { ...s, i, ticketNo: i + 1, cumRevenue, yVal: metric === "revenue" ? cumRevenue : s.price };
   });
   const maxY = Math.max(...points.map((p) => p.yVal), 1e-9);
 
@@ -1392,7 +1447,7 @@ const SalesChart = ({ series }) => {
           >
             <div className="rounded-lg bg-slate-900 text-white px-3 py-2 shadow-lg whitespace-nowrap">
               <p className="text-xs font-semibold">{active.title}</p>
-              <p className="text-[11px] text-slate-300">Ticket #{active.id} · sale {active.ticketNo} of {count}</p>
+              <p className="text-[11px] text-slate-300">{active.id ? `Ticket #${active.id} · ` : ""}sale {active.ticketNo} of {count}</p>
               <p className="text-sm font-bold mt-0.5">{rm(active.price)} <span className="text-[11px] font-medium text-slate-400">({ethLabel(active.price, 3)})</span></p>
               {metric === "revenue" && <p className="text-[11px] text-emerald-300">Running total {rm(active.cumRevenue)}</p>}
               <p className="text-[11px] text-slate-400 mt-0.5">{formatSaleTime(active.t)}</p>

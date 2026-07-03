@@ -7,7 +7,7 @@ import {
   Ticket, ShieldCheck, ArrowRight, Zap, X, Ban, CheckCircle2
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
-import { CONTRACT_ADDRESS, CONTRACT_ABI, PUBLIC_RPC_URL, START_BLOCK, getContractAddress } from "./constants";
+import { CONTRACT_ABI, PUBLIC_RPC_URL, getContractAddress, getDeployments } from "./constants";
 import {
   EVENT_STATUS, normalizeEventName, isTransferFrozen, fetchPublicEventStatusMap
 } from "./eventStatus";
@@ -169,12 +169,15 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
       //    reported network.
       const allowLocal = import.meta.env.DEV;
       let chainId = 11155111;
+      let walletMatchesChain = false;   // is the wallet actually on the chain we read?
+      let walletProvider = null;        // the wallet's own RPC (reliable for logs)
       if (wallet) {
         try {
-          const eip1193Provider = await wallet.getEthereumProvider();
-          const walletChain = Number((await new ethers.BrowserProvider(eip1193Provider).getNetwork()).chainId);
+          walletProvider = new ethers.BrowserProvider(await wallet.getEthereumProvider());
+          const walletChain = Number((await walletProvider.getNetwork()).chainId);
           if (walletChain === 11155111 || (allowLocal && walletChain === 31337)) {
             chainId = walletChain;
+            walletMatchesChain = true;
           }
           // Any other chain (mainnet, or a stray localhost node in production)
           // falls through to Sepolia — the only network this app supports.
@@ -183,40 +186,68 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
         }
       }
       setActiveChainId(chainId);
-      const contractAddress = getContractAddress(chainId);
-      const startBlock = chainId === 11155111 ? START_BLOCK : 0;
-      const candidates = chainId === 31337 ? ["http://127.0.0.1:8545"] : [...new Set(SEPOLIA_READ_RPCS)];
+      // Every contract this wallet's tickets could live on. After a redeploy,
+      // tickets bought on an older contract are orphaned unless we scan it too.
+      const deployments = getDeployments(chainId);
+      const primary = deployments[0];
+      const urls = chainId === 31337 ? ["http://127.0.0.1:8545"] : [...new Set(SEPOLIA_READ_RPCS)];
 
-      // 2) Pick a provider AND read this wallet's Transfer history in one step,
-      //    so the choice is validated by the real query we depend on. incoming =
-      //    tokens transferred TO us (incl. the purchase); outgoing = ones we sent
-      //    away. The set difference is exactly what we currently own.
-      let provider = null, contract = null, incoming = [], outgoing = [];
-      for (const url of candidates) {
+      // Ordered read providers to try. The embedded wallet's OWN RPC (Privy/
+      // Alchemy-backed) has generous eth_getLogs limits and is proven reliable —
+      // the organizer dashboard reads through it — so try it FIRST when the
+      // wallet is on the chain we're reading, then fall back to the public RPCs.
+      // Some public RPCs silently cap historical log ranges and return nothing,
+      // which is why a freshly-bought ticket never appeared in "Your tickets".
+      const readProviders = [];
+      if (walletMatchesChain && walletProvider) readProviders.push(walletProvider);
+      urls.forEach((u) => readProviders.push(new ethers.JsonRpcProvider(u)));
+
+      // 2) Native ETH balance FIRST, and independently of the heavier historical
+      //    log queries below. `getBalance` works on ANY provider, so a funded
+      //    wallet must never read 0 just because an archival eth_getLogs call was
+      //    rate-limited/rejected (that early-return used to strand it at 0.00).
+      if (walletAddress) {
+        setIsFetchingBalance(true);
+        let gotBalance = false;
+        for (const p of readProviders) {
+          try {
+            setEthBalance(ethers.formatEther(await p.getBalance(walletAddress)));
+            gotBalance = true;
+            break;
+          } catch (e) {
+            console.warn("Balance read failed on a provider:", e?.message);
+          }
+        }
+        if (!gotBalance) console.error("All providers failed to return a balance.");
+        setIsFetchingBalance(false);
+      }
+
+      // 3) Pick a provider that can actually serve historical logs, validating it
+      //    with the real query we depend on (some accept getBlockNumber but
+      //    reject eth_getLogs — see the SEPOLIA_READ_RPCS note).
+      let provider = null;
+      for (const p of readProviders) {
         try {
-          const p = new ethers.JsonRpcProvider(url);
-          const c = new ethers.Contract(contractAddress, CONTRACT_ABI, p);
           if (walletAddress) {
-            [incoming, outgoing] = await Promise.all([
-              c.queryFilter(c.filters.Transfer(null, walletAddress), startBlock),
-              c.queryFilter(c.filters.Transfer(walletAddress, null), startBlock),
-            ]);
+            const c = new ethers.Contract(primary.address, CONTRACT_ABI, p);
+            await c.queryFilter(c.filters.Transfer(null, walletAddress), primary.startBlock);
           } else {
             await p.getBlockNumber();
           }
-          provider = p; contract = c;
-          break; // this RPC works — reuse it for the rest
+          provider = p;
+          break; // this provider works — reuse it for the rest
         } catch (e) {
-          console.warn(`Read RPC ${url} failed:`, e?.info?.error?.message || e?.message);
+          console.warn("Read provider failed log validation:", e?.info?.error?.message || e?.message);
         }
       }
 
       if (!provider) {
-        console.error("No working read RPC. Cannot sync wallet.");
-        return;
+        console.error("No working read provider for ticket logs (balance already shown).");
+        return; // balance is already set above; just skip the ticket sync this round
       }
 
-      setIsPaused(await contract.paused().catch(() => false));
+      const primaryContract = new ethers.Contract(primary.address, CONTRACT_ABI, provider);
+      setIsPaused(await primaryContract.paused().catch(() => false));
 
       // Logged out → nothing to show in "Your tickets".
       if (!walletAddress) {
@@ -224,53 +255,60 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
         return;
       }
 
-      // 3) Balance + authoritative owned count.
-      setIsFetchingBalance(true);
-      try {
-        setEthBalance(ethers.formatEther(await provider.getBalance(walletAddress)));
-      } catch (balErr) {
-        console.error("Error fetching balance:", balErr);
-      } finally {
-        setIsFetchingBalance(false);
-      }
-      try {
-        setTicketBalance(Number(await contract.balanceOf(walletAddress)));
-      } catch (tErr) {
-        console.warn("balanceOf failed:", tErr?.message);
-      }
-
-      // 4) Owned token IDs from Transfer logs (incoming − outgoing).
-      const owned = new Set(incoming.map((l) => l.args[2].toString()));
-      outgoing.forEach((l) => owned.delete(l.args[2].toString()));
-      const ownedIds = [...owned];
-
-      // owner === me for every owned token, so isPrimary is the same for all.
-      const iAmOrganizer = await contract.whitelistedOrganizers(walletAddress).catch(() => false);
-
-      // Details only for the tokens we own (small N, gentle on the RPC + retry).
-      const ticketList = (await mapLimit(ownedIds, 4, async (id) => {
+      // 4) Scan EVERY deployment for tickets this wallet owns, tagging each with
+      //    the contract it lives on (so resale/transfer target the right one).
+      //    Owned = Transfer-in minus Transfer-out per contract.
+      const perContract = await Promise.all(deployments.map(async (dep) => {
         try {
-          const details = await withRetry(() => contract.getTicketDetails(id));
-          return {
-            id: id.toString(),
-            eventTitle: details.eventName || `Ticket #${id}`,
-            mintPrice: parseFloat(ethers.formatEther(details.originalPrice || 0n)),
-            isUsed: details.isUsed || false,
-            isListed: details.isForResale || false,
-            resalePrice: details.resalePrice ? parseFloat(ethers.formatEther(details.resalePrice)) : 0,
-            owner: walletAddress,
-            isPrimary: iAmOrganizer,
-            category: "VIP",
-            imageUri: "https://images.unsplash.com/photo-1540039155732-68473500d6cb?q=80&w=800&auto=format&fit=crop",
-            date: "Oct 24, 2026",
-            venue: "Global Main Stage"
-          };
-        } catch (ticketErr) {
-          console.warn(`Skipped token #${id}:`, ticketErr?.message);
-          return null;
+          const c = new ethers.Contract(dep.address, CONTRACT_ABI, provider);
+          const [incoming, outgoing] = await Promise.all([
+            c.queryFilter(c.filters.Transfer(null, walletAddress), dep.startBlock),
+            c.queryFilter(c.filters.Transfer(walletAddress, null), dep.startBlock),
+          ]);
+          const owned = new Set(incoming.map((l) => l.args[2].toString()));
+          outgoing.forEach((l) => owned.delete(l.args[2].toString()));
+          const iAmOrganizer = await c.whitelistedOrganizers(walletAddress).catch(() => false);
+          const rows = await mapLimit([...owned], 4, async (id) => {
+            try {
+              const details = await withRetry(() => c.getTicketDetails(id));
+              return {
+                id: id.toString(),
+                contractAddress: dep.address,
+                eventTitle: details.eventName || `Ticket #${id}`,
+                mintPrice: parseFloat(ethers.formatEther(details.originalPrice || 0n)),
+                isUsed: details.isUsed || false,
+                isListed: details.isForResale || false,
+                resalePrice: details.resalePrice ? parseFloat(ethers.formatEther(details.resalePrice)) : 0,
+                owner: walletAddress,
+                isPrimary: iAmOrganizer,
+                category: "VIP",
+                imageUri: "https://images.unsplash.com/photo-1540039155732-68473500d6cb?q=80&w=800&auto=format&fit=crop",
+                date: "Oct 24, 2026",
+                venue: "Global Main Stage"
+              };
+            } catch (ticketErr) {
+              console.warn(`Skipped token #${id} on ${dep.address}:`, ticketErr?.message);
+              return null;
+            }
+          });
+          return rows.filter(Boolean);
+        } catch (depErr) {
+          console.warn(`Deployment ${dep.address} scan failed:`, depErr?.message);
+          return [];
         }
-      })).filter(Boolean);
+      }));
 
+      // Flatten newest-first; dedupe colliding token ids (newest contract wins)
+      // so the per-id lookups in the resale/transfer handlers stay unambiguous.
+      const seen = new Set();
+      const ticketList = [];
+      perContract.forEach((rows) => rows.forEach((t) => {
+        if (seen.has(t.id)) return;
+        seen.add(t.id);
+        ticketList.push(t);
+      }));
+
+      setTicketBalance(ticketList.length);
       setTickets(ticketList);
     } catch (error) {
       console.error("Dashboard Sync Error:", error);
@@ -285,12 +323,13 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
     fetchDashboardData();
   }, [walletAddress]);
 
-  // Arriving straight from checkout, the public RPC can still be a block or two
-  // behind, so the just-bought ticket may not be visible on the first read.
-  // Re-sync a couple of times after landing so it appears without a manual tap.
+  // Arriving straight from checkout, the public RPC's log index can still be
+  // several blocks behind, so the just-bought ticket may not be visible on the
+  // first read. Re-sync a few times (spread out) after landing so it appears
+  // without a manual tap even when Sepolia indexing is slow.
   useEffect(() => {
     if (!purchaseBanner || !walletAddress) return;
-    const timers = [3000, 8000].map((ms) => setTimeout(() => fetchDashboardData(), ms));
+    const timers = [1500, 4000, 9000, 15000].map((ms) => setTimeout(() => fetchDashboardData(), ms));
     return () => timers.forEach(clearTimeout);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [purchaseBanner, walletAddress]);
@@ -299,6 +338,12 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
   useEffect(() => {
     fetchPublicEventStatusMap().then(setEventStatusMap).catch(() => {});
   }, [tickets.length]);
+
+  // A ticket may live on an older contract deployment (it was minted/bought
+  // before the last redeploy). Resale/transfer must target THAT contract, not
+  // the current one — otherwise the token doesn't exist there and the tx reverts.
+  const contractForTicket = (ticketId) =>
+    tickets.find((t) => t.id === String(ticketId))?.contractAddress || getContractAddress(activeChainId);
 
   const onListResale = async (ticketId, price) => {
     if (!wallet) return;
@@ -333,7 +378,7 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
       }
 
       const signer = await provider.getSigner();
-      const contractAddress = getContractAddress(targetChainId);
+      const contractAddress = contractForTicket(ticketId);
       const contract = new ethers.Contract(contractAddress, CONTRACT_ABI, signer);
       const priceInWei = ethers.parseEther(price.toString());
       const tx = await contract.listTicketForResale(ticketId, priceInWei);
@@ -376,7 +421,7 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
       }
 
       const signer = await provider.getSigner();
-      const contractAddress = getContractAddress(targetChainId);
+      const contractAddress = contractForTicket(ticketId);
       const contract = new ethers.Contract(contractAddress, CONTRACT_ABI, signer);
       const tx = await contract.cancelResaleListing(ticketId);
       await tx.wait();
@@ -421,7 +466,7 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
       }
 
       const signer = await provider.getSigner();
-      const contractAddress = getContractAddress(targetChainId);
+      const contractAddress = contractForTicket(ticketId);
       const contract = new ethers.Contract(contractAddress, CONTRACT_ABI, signer);
       const tx = await contract.safeTransferFrom(walletAddress, toAddress, ticketId);
       await tx.wait();
@@ -689,7 +734,7 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
                   meta={eventStatusMap[normalizeEventName(ticket.eventTitle)]?.ev}
                   status={statusFor(ticket.eventTitle)}
                   owner={walletAddress}
-                  contractAddress={getContractAddress(activeChainId)}
+                  contractAddress={ticket.contractAddress || getContractAddress(activeChainId)}
                   chainId={activeChainId}
                   onResell={() => { setResaleTicket(ticket); setResalePriceInput(""); }}
                   onTransfer={() => { setTransferTicket(ticket); setRecipientAddress(""); }}
