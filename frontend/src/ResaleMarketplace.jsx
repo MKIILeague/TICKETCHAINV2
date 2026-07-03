@@ -39,6 +39,37 @@ async function withRetry(fn, tries = 3) {
   throw lastErr;
 }
 
+// Multicall3 — deployed at the SAME canonical address on virtually every chain
+// (incl. Sepolia). It batches many view reads into ONE eth_call, which is what
+// makes the resale scan fast: instead of O(total supply) HTTP round-trips (one
+// per token, the old path), we do a handful of aggregate3 calls. It also works
+// even though the RPC disables JSON-RPC batching, because it's a single call.
+const MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11";
+const MULTICALL3_ABI = [
+  "function aggregate3((address target, bool allowFailure, bytes callData)[] calls) view returns ((bool success, bytes returnData)[] returnData)",
+];
+
+// Batch-read `fn(...args)` across many argument sets via Multicall3. Returns an
+// array aligned with `argSets`; entries that reverted/failed decode are null.
+async function multicallRead(provider, contractAddress, iface, fn, argSets, chunkSize = 100) {
+  const mc = new ethers.Contract(MULTICALL3_ADDRESS, MULTICALL3_ABI, provider);
+  const out = new Array(argSets.length).fill(null);
+  for (let i = 0; i < argSets.length; i += chunkSize) {
+    const slice = argSets.slice(i, i + chunkSize);
+    const calls = slice.map((args) => ({
+      target: contractAddress,
+      allowFailure: true,
+      callData: iface.encodeFunctionData(fn, args),
+    }));
+    const res = await withRetry(() => mc.aggregate3(calls));
+    res.forEach((r, j) => {
+      if (!r.success || r.returnData === "0x") return;
+      try { out[i + j] = iface.decodeFunctionResult(fn, r.returnData); } catch { /* leave null */ }
+    });
+  }
+  return out;
+}
+
 // A read-only provider + the chain we're reading.
 //
 // We deliberately do NOT read bulk on-chain data through the Privy embedded
@@ -106,48 +137,88 @@ export default function ResaleMarketplace({ walletAddress, wallet, connectWallet
         getReadContext(wallet),
         loadEventMeta(),
       ]);
-      const contract = new ethers.Contract(getContractAddress(chainId), CONTRACT_ABI, provider);
+      const contractAddress = getContractAddress(chainId);
+      const contract = new ethers.Contract(contractAddress, CONTRACT_ABI, provider);
+      const iface = contract.interface;
 
       // Enumerate every minted token (1..nextId). Using getNextTicketId avoids
       // log-range limits that some free RPCs impose on eth_getLogs.
       const total = Number(await withRetry(() => contract.getNextTicketId()));
       const ids = Array.from({ length: total }, (_, i) => i + 1);
 
-      // Cache "is this address a whitelisted organizer?" so we don't re-ask per token.
-      const orgCache = new Map();
-      const isOrganizer = async (addr) => {
-        const key = addr.toLowerCase();
-        if (orgCache.has(key)) return orgCache.get(key);
-        const res = await withRetry(() => contract.whitelistedOrganizers(addr)).catch(() => false);
-        orgCache.set(key, res);
-        return res;
-      };
+      // Discover the peer-resale candidates: { id, details, owner }. On Sepolia we
+      // batch the reads through Multicall3 (a few calls total); on localhost —
+      // where Multicall3 usually isn't deployed — fall back to per-token reads.
+      let candidates = [];
+      let mcSucceeded = false;
+      const useMulticall = chainId === 11155111;
 
-      const rows = (await mapLimit(ids, 4, async (id) => {
+      if (useMulticall) {
         try {
-          const details = await withRetry(() => contract.getTicketDetails(id));
-          if (!details.isForResale || details.isUsed) return null;
-          const owner = await withRetry(() => contract.ownerOf(id));
-          // Peer resales only — skip organizers' primary auto-listed inventory.
-          if (await isOrganizer(owner)) return null;
+          // 1) getTicketDetails for every token in a handful of batched calls.
+          const detailsArr = await multicallRead(provider, contractAddress, iface, "getTicketDetails", ids.map((id) => [id]));
+          const listed = [];
+          ids.forEach((id, i) => {
+            const d = detailsArr[i]?.[0];
+            if (d && d.isForResale && !d.isUsed) listed.push({ id, details: d });
+          });
 
-          const eventTitle = (details.eventName || `Ticket #${id}`).trim();
-          const meta = metaMap.get(eventTitle) || null;
-          return {
-            id: id.toString(),
-            eventTitle,
-            owner,
-            resalePrice: parseFloat(ethers.formatEther(details.resalePrice || 0n)),
-            originalPrice: parseFloat(ethers.formatEther(details.originalPrice || 0n)),
-            banner: meta?.imageHash ? ipfsToHttp(meta.imageHash) : "",
-            venue: meta?.venue || "Venue TBA",
-            timestamp: meta?.timestamp || 0,
-            category: meta?.category || "",
-          };
-        } catch {
-          return null; // unreadable / nonexistent token — skip
+          // 2) ownerOf only for the listed/unused ones, batched.
+          const ownersArr = await multicallRead(provider, contractAddress, iface, "ownerOf", listed.map((l) => [l.id]));
+          listed.forEach((l, i) => { l.owner = ownersArr[i]?.[0] || null; });
+
+          // 3) whitelistedOrganizers for each unique owner, batched — to drop
+          //    organizers' primary auto-listed inventory (peer resales only).
+          const uniqueOwners = [...new Set(listed.map((l) => l.owner).filter(Boolean).map((o) => o.toLowerCase()))];
+          const orgArr = await multicallRead(provider, contractAddress, iface, "whitelistedOrganizers", uniqueOwners.map((o) => [o]));
+          const orgMap = new Map();
+          uniqueOwners.forEach((o, i) => orgMap.set(o, !!orgArr[i]?.[0]));
+
+          candidates = listed.filter((l) => l.owner && !orgMap.get(l.owner.toLowerCase()));
+          mcSucceeded = true; // trust this result even if it's empty (no peer resales)
+        } catch (mcErr) {
+          console.warn("[resale] multicall path failed, falling back to per-token:", mcErr?.message);
         }
-      })).filter(Boolean);
+      }
+
+      // Fallback (localhost, or if the multicall call itself failed): the original
+      // bounded-concurrency per-token scan. NOT run when multicall succeeded with
+      // zero results — that's a legitimately empty resale board.
+      if (!mcSucceeded) {
+        const orgCache = new Map();
+        const isOrganizer = async (addr) => {
+          const key = addr.toLowerCase();
+          if (orgCache.has(key)) return orgCache.get(key);
+          const res = await withRetry(() => contract.whitelistedOrganizers(addr)).catch(() => false);
+          orgCache.set(key, res);
+          return res;
+        };
+        candidates = (await mapLimit(ids, 6, async (id) => {
+          try {
+            const details = await withRetry(() => contract.getTicketDetails(id));
+            if (!details.isForResale || details.isUsed) return null;
+            const owner = await withRetry(() => contract.ownerOf(id));
+            if (await isOrganizer(owner)) return null;
+            return { id, details, owner };
+          } catch { return null; }
+        })).filter(Boolean);
+      }
+
+      const rows = candidates.map(({ id, details, owner }) => {
+        const eventTitle = (details.eventName || `Ticket #${id}`).trim();
+        const meta = metaMap.get(eventTitle) || null;
+        return {
+          id: id.toString(),
+          eventTitle,
+          owner,
+          resalePrice: parseFloat(ethers.formatEther(details.resalePrice || 0n)),
+          originalPrice: parseFloat(ethers.formatEther(details.originalPrice || 0n)),
+          banner: meta?.imageHash ? ipfsToHttp(meta.imageHash) : "",
+          venue: meta?.venue || "Venue TBA",
+          timestamp: meta?.timestamp || 0,
+          category: meta?.category || "",
+        };
+      });
 
       // Attach seller display names from saved profiles (profiles/{address}),
       // so cards read "Sold by Syed" instead of a raw 0x… address. Cached + deduped
