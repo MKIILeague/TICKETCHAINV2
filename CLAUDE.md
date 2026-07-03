@@ -1,3 +1,9 @@
+The frontend dashboard failed when trying to approve or whitelist an organizer. The application popped up this exact `CALL_EXCEPTION` alert:
+
+"Approval failed: missing revert data (action="estimateGas", data=null, reason=null, transaction={ "data": "0x986ab59200000000000000000000000006c159b11b9f8e8723891e3dee07fa8c40857c51", "from": "0x6eeE97e0DFdaf29f365Fa82e26B63388f5748f707", "to": "0x5FbDB2315678afecb367f032d93F642f64180aa3" }, invocation=null, revert=null, code=CALL_EXCEPTION, version=6.16.0)"
+
+Please analyze why this transaction is failing during gas estimation. Check if the smart contract address (`to: 0x5FbDB...`) is pointing to a local hardhat node instead of Sepolia, or if the calling Admin wallet (`from: 0x6eeE9...`) lacks the proper authorization modifier permissions to execute this approval function.
+
 # CLAUDE.md
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
@@ -70,26 +76,7 @@ Client-side role checks (`RequireRole.jsx`, the navbar) are **UX only**. Real au
 Admin approval is a **two-part action**: write `status:"approved"` to Firestore AND send the on-chain `whitelistOrganizer` tx. Firestore status is just the UI signal; the contract whitelist is the real gate enforced at mint time. The backend `verifyPrivyToken` middleware is the server-side equivalent for the Express service.
 
 ### Routing (`frontend/src/App.jsx`)
-React Router v7, single `<BrowserRouter>` defined in `App.jsx`. Two route groups:
-
-**Consumer routes** — share `ConsumerLayout` (navbar + footer):
-| Path | Component | Notes |
-|------|-----------|-------|
-| `/` | `BuyerResellerDashboard` (`view="events"`) | Marketplace + landing page. **Public** — viewable logged-out via public RPC, so NOT wrapped in `RequireRole`. |
-| `/wallet` | `BuyerResellerDashboard` (`view="wallet"`) | `RequireRole allow={["buyer"]}` |
-| `/organizer` | `OrganizerLanding` | Register/login entry chooser. |
-| `/organizer/register` | `OrganizerDashboard` (`mode="register"`) | |
-| `/organizer/login` | `OrganizerDashboard` (`mode="login"`) | |
-| `/admin/login` | `AdminLogin` | Hidden entry, not linked in navbar. |
-
-**Bare full-screen routes** — no consumer navbar:
-| Path | Component | Guard |
-|------|-----------|-------|
-| `/organizer/dashboard` | `OrganizerDashboard` (`mode="dashboard"`) | `allow={["organizer"]}` |
-| `/gatekeeper` | `GatekeeperTerminal` | `allow={["gatekeeper"]}` — mobile-gate oriented |
-| `/admin/dashboard` | `SystemAdminConsole` | `allow={["admin"]}` |
-
-The page components take `walletAddress / wallet / connectWallet` props (sourced from `useTicketWallet`; `connectWallet` is Privy `login`). `OrganizerDashboard` additionally takes `mode` + `logout / authenticated / ready`.
+React Router v7. Consumer routes (`/`, `/wallet`, organizer entry, admin login) share `ConsumerLayout` (navbar + footer). The organizer dashboard and gatekeeper terminal render **bare full-screen** (no consumer navbar) — gatekeeper is mobile-gate oriented. Routes are wrapped in `RequireRole`. The marketplace lives at `/` (it IS the landing page).
 
 ### On-chain interaction pattern (ethers v6 + Privy)
 Every component that touches the chain repeats the same dance (see `BuyerResellerDashboard.jsx`, `OrganizerDashboard.jsx`, `GatekeeperTerminal.jsx`):
@@ -118,14 +105,12 @@ ERC721URIStorage + Ownable + ReentrancyGuard + Pausable. Solidity 0.8.24, `cancu
 - `backend/.env`: `PORT`, `PRIVY_APP_ID`, `PRIVY_JWKS_URI`, `ALLOWED_ORIGINS` (CORS).
 - The Privy `appId` is hardcoded in `frontend/src/main.jsx`. Privy only allows the `localhost` origin (not `127.0.0.1`) — `main.jsx` auto-redirects `127.0.0.1`/`[::1]` to `localhost` before React mounts, and a `PrivyErrorBoundary` surfaces origin/403 errors instead of a blank screen.
 - Root `package.json` is `"type": "module"`, so the Hardhat config is `hardhat.config.cjs` (CommonJS) deliberately.
-- ⚠️ **This repo lives in a OneDrive folder.** OneDrive sync can silently roll individual files back to older versions (it has reverted `frontend/src/App.jsx`, `main.jsx`, and `constants.js` to stale/scaffold versions before — symptoms: the default Vite splash page, a black screen, or missing `constants.js` exports). If the app suddenly breaks without a code change you made, check these files first (`git diff` if versioned, or confirm `App.jsx` still defines the router and `constants.js` still exports `getContractAddress` / `START_BLOCK` / `PUBLIC_RPC_URL`). Pausing OneDrive sync during active development avoids this.
-
-### Frontend source map (`frontend/src/`)
-- `App.jsx` — router + `ConsumerLayout` (navbar/footer); `main.jsx` — Privy provider, `127.0.0.1`→`localhost` redirect, `PrivyErrorBoundary`.
-- `useTicketWallet.js` — identity/role hook; `orgStatus.js` — shared, cached+deduped `organisers/{address}` reads (8s timeout, stale-while-revalidate).
-- Pages: `BuyerResellerDashboard.jsx` (marketplace + wallet), `OrganizerLanding.jsx`, `OrganizerDashboard.jsx`, `GatekeeperTerminal.jsx`, `AdminLogin.jsx`, `SystemAdminConsole.jsx`. `LandingView.jsx` is legacy (state-based `setRole` nav, not wired into the router).
-- `RequireRole.jsx` — UX-only route guard; `constants.js` — addresses/ABI/RPC; `firebase.js` — Firestore init.
 
 ## Reference docs in repo
 - `run_guide.md` — step-by-step local + Sepolia run/test instructions.
-- `TicketChain_Development_Phases.md` — the original product/architecture spec (roles, the 110% rule, hybrid storage). Treat it as intent; the code is the source of truth for current behavior.
+- `TicketChain_Development_Phases.md` — the original product/architecture spec (roles, the 110% rule, hybrid storage). Treat it as intent; the 
+
+
+
+
+code is the source of truth for current behavior.
