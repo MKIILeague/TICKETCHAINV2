@@ -13,6 +13,8 @@ import { CONTRACT_ADDRESS, CONTRACT_ABI, START_BLOCK, getContractAddress } from 
 import { db } from "./firebase";
 import { doc, setDoc, getDoc, deleteDoc, collection, query, where, getDocs } from "firebase/firestore";
 import { fetchOrgStatus, getCachedOrgStatus, setOrgStatusCache } from "./orgStatus";
+import { EVENT_STATUS, effectiveStatus } from "./eventStatus";
+import { ipfsToHttp } from "./ipfs";
 import EventWizard from "./EventWizard";
 
 const USD_PER_ETH = 3500; // rough display-only conversion
@@ -605,41 +607,55 @@ const OrganizerDashboard = ({ walletAddress, wallet, connectWallet, logout, mode
   // A ticket is "sold" once it leaves the organizer's wallet (bought by someone);
   // "available" = still held by the organizer & not redeemed; "redeemed" = used at gate.
   const me = (walletAddress || "").toLowerCase();
-  // Firestore sold/supply keyed by event title (the on-chain `eventName` equals
-  // the Firestore `headline`), so we can reconcile the two sources below.
-  const fsByTitle = useMemo(() => {
-    const m = {};
-    eventDocs.forEach((e) => {
-      const title = (e.headline || "").trim();
-      if (title) m[title] = { supply: Number(e.aggregateSupply) || 0, sold: Number(e.sold) || 0 };
-    });
-    return m;
-  }, [eventDocs]);
-
+  // The on-chain `eventName` equals the Firestore `headline`, so the two sources
+  // reconcile by title below.
   const eventStats = useMemo(() => {
     const groups = {};
+
+    // 1) Seed from the organizer's published Firestore events — the same source
+    //    of truth buyers see on the storefront. This is what keeps the overview
+    //    populated even when the on-chain log query is empty (fresh redeploy,
+    //    stale START_BLOCK on Sepolia, or a flaky RPC). Drafts/deleted are hidden.
+    eventDocs.forEach((e) => {
+      const title = (e.headline || "").trim();
+      if (!title) return;
+      const status = effectiveStatus(e);
+      if (status === EVENT_STATUS.DRAFT || status === EVENT_STATUS.DELETED || !status) return;
+      const total = Number(e.aggregateSupply) || 0;
+      const sold = Number(e.sold) || 0;
+      groups[title] = {
+        title,
+        price: e.priceEth || "0",
+        total,
+        sold,
+        available: Math.max(0, total - sold),
+        redeemed: 0,
+        status,
+        timestamp: e.timestamp || null,
+        imageHash: e.imageHash || null,
+      };
+    });
+
+    // 2) Overlay on-chain ticket data. `redeemed` is live gate state (never in
+    //    Firestore), so it always comes from chain. Any on-chain event with no
+    //    matching Firestore doc (legacy mint) still gets its own card.
     tickets.forEach((t) => {
       const title = (t.eventTitle || "Untitled").split(" #")[0];
-      if (!groups[title]) groups[title] = { title, price: t.mintPrice, total: 0, sold: 0, available: 0, redeemed: 0 };
-      const g = groups[title];
-      g.total += 1;
+      let g = groups[title];
+      if (!g) {
+        g = groups[title] = { title, price: t.mintPrice, total: 0, sold: 0, available: 0, redeemed: 0, status: EVENT_STATUS.PUBLISHED, timestamp: null, imageHash: null };
+        g._onChainOnly = true;
+      }
       if (t.isUsed) g.redeemed += 1;
-      if (t.owner && t.owner.toLowerCase() !== me) g.sold += 1;
-      else if (!t.isUsed) g.available += 1;
-    });
-    // Prefer the off-chain counter (the number buyers see on the storefront and
-    // at checkout) for total/sold so all three views show identical counts.
-    // `redeemed` stays on-chain — it's the live gate state, not tracked off-chain.
-    Object.values(groups).forEach((g) => {
-      const fs = fsByTitle[g.title];
-      if (fs) {
-        if (fs.supply) g.total = fs.supply;
-        g.sold = fs.sold;
-        g.available = Math.max(0, g.total - g.sold);
+      if (g._onChainOnly) {
+        g.total += 1;
+        if (t.owner && t.owner.toLowerCase() !== me) g.sold += 1;
+        else if (!t.isUsed) g.available += 1;
       }
     });
+
     return Object.values(groups).sort((a, b) => b.total - a.total);
-  }, [tickets, me, fsByTitle]);
+  }, [tickets, me, eventDocs]);
 
   const filteredEvents = eventStats.filter((e) => e.title.toLowerCase().includes(searchQuery.toLowerCase()));
   const totalSold = eventStats.reduce((a, e) => a + e.sold, 0);
@@ -834,38 +850,54 @@ const OrganizerDashboard = ({ walletAddress, wallet, connectWallet, logout, mode
               <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
                 <StatCard icon={<DollarSign />} label="Sales pool" value={`${parseFloat(totalRevenue).toFixed(3)} ETH`} sub="Escrowed in contract" color="indigo" />
                 <StatCard icon={<TicketIcon />} label="Tickets sold" value={`${totalSold} / ${totalMinted}`} sub="Across all events" color="emerald" />
-                <StatCard icon={<ShieldAlert />} label="Active events" value={`${eventStats.length}`} sub="Currently issued" color="amber" />
+                <StatCard icon={<ShieldAlert />} label="Active events" value={`${eventStats.length}`} sub="Published & live" color="amber" />
               </div>
 
               <div>
-                {/* On-chain sales analytics (published/minted events) */}
+                {/* Sales analytics for the organizer's published events */}
                 <div className="bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden flex flex-col self-start">
                   <div className="p-5 border-b border-slate-100 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
                     <div className="flex items-center gap-3">
                       <h3 className="text-base font-semibold text-slate-900">Active events</h3>
-                      <span className="text-xs text-slate-500">{eventStats.length} on-chain</span>
+                      <span className="text-xs text-slate-500">{eventStats.length} published</span>
                     </div>
                     <button onClick={() => setSection("events")} className="inline-flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-sm font-semibold transition-colors">
                       <Plus size={15} /> New event
                     </button>
                   </div>
-                  <div className="p-4 border-b border-slate-100">
-                    <div className="relative">
-                      <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
-                      <input type="text" placeholder="Search events" value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} className="w-full bg-white border border-slate-200 rounded-xl pl-10 pr-4 py-2.5 text-sm text-slate-900 placeholder:text-slate-400 focus:outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-100 transition-all" />
+                  {eventStats.length > 0 && (
+                    <div className="p-4 border-b border-slate-100">
+                      <div className="relative">
+                        <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+                        <input type="text" placeholder="Search events" value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} className="w-full bg-white border border-slate-200 rounded-xl pl-10 pr-4 py-2.5 text-sm text-slate-900 placeholder:text-slate-400 focus:outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-100 transition-all" />
+                      </div>
                     </div>
-                  </div>
+                  )}
                   <div className="p-4 space-y-3 overflow-y-auto max-h-[560px]">
                     {filteredEvents.map((ev) => {
                       const pct = ev.total > 0 ? Math.round((ev.sold / ev.total) * 100) : 0;
+                      const dateLabel = formatEventDate(ev.timestamp);
+                      const banner = ev.imageHash ? ipfsToHttp(ev.imageHash) : "";
                       return (
                         <div key={ev.title} className="bg-slate-50 border border-slate-200 rounded-xl p-5 hover:border-slate-300 transition-colors">
-                          <div className="flex justify-between items-start mb-3">
-                            <div>
-                              <h4 className="text-slate-900 font-semibold text-sm">{ev.title}</h4>
-                              <p className="text-xs text-slate-500 mt-0.5">{ev.price} ETH / ticket</p>
+                          <div className="flex justify-between items-start gap-4 mb-3">
+                            <div className="flex items-start gap-3 min-w-0">
+                              <div className="w-11 h-11 rounded-lg overflow-hidden bg-slate-200 shrink-0 flex items-center justify-center">
+                                {banner
+                                  ? <img src={banner} alt="" className="w-full h-full object-cover" />
+                                  : <TicketIcon className="w-5 h-5 text-slate-400" />}
+                              </div>
+                              <div className="min-w-0">
+                                <div className="flex items-center gap-2 flex-wrap">
+                                  <h4 className="text-slate-900 font-semibold text-sm truncate">{ev.title}</h4>
+                                  <EventStatusBadge status={ev.status} />
+                                </div>
+                                <p className="text-xs text-slate-500 mt-0.5">
+                                  {ev.price} ETH / ticket{dateLabel ? ` · ${dateLabel}` : ""}
+                                </p>
+                              </div>
                             </div>
-                            <div className="text-right">
+                            <div className="text-right shrink-0">
                               <p className="text-xl font-bold text-emerald-600">{ev.sold}<span className="text-slate-400 text-sm font-semibold">/{ev.total}</span></p>
                               <p className="text-xs text-slate-500">Sold ({pct}%)</p>
                             </div>
@@ -881,10 +913,20 @@ const OrganizerDashboard = ({ walletAddress, wallet, connectWallet, logout, mode
                         </div>
                       );
                     })}
-                    {filteredEvents.length === 0 && (
+                    {eventStats.length > 0 && filteredEvents.length === 0 && (
                       <div className="p-16 text-center text-slate-400">
-                        <TicketIcon className="w-10 h-10 mx-auto mb-3 opacity-30" />
-                        <p className="text-sm">No published events yet. Create one from the Events tab.</p>
+                        <Search className="w-9 h-9 mx-auto mb-3 opacity-30" />
+                        <p className="text-sm">No events match “{searchQuery}”.</p>
+                      </div>
+                    )}
+                    {eventStats.length === 0 && (
+                      <div className="p-16 text-center">
+                        <TicketIcon className="w-10 h-10 mx-auto mb-3 text-slate-300" />
+                        <p className="text-sm text-slate-500 font-medium">No published events yet</p>
+                        <p className="text-xs text-slate-400 mt-1 mb-5">Publish an event and it will show up here with live sales.</p>
+                        <button onClick={() => setSection("events")} className="inline-flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-sm font-semibold transition-colors">
+                          <Plus size={15} /> Create your first event
+                        </button>
                       </div>
                     )}
                   </div>
@@ -1160,6 +1202,26 @@ const MiniStat = ({ value, label, valueClass = "text-slate-900" }) => (
     <p className="text-xs text-slate-500">{label}</p>
   </div>
 );
+
+// Compact event date (seconds epoch) for the overview cards.
+const formatEventDate = (ts) =>
+  ts ? new Date(ts * 1000).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }) : null;
+
+// Coloured pill for the effective event lifecycle status.
+const EventStatusBadge = ({ status }) => {
+  const map = {
+    [EVENT_STATUS.PUBLISHED]: { label: "Live", cls: "bg-emerald-50 text-emerald-700 border-emerald-200" },
+    [EVENT_STATUS.FINISHED]: { label: "Past", cls: "bg-slate-100 text-slate-500 border-slate-200" },
+    [EVENT_STATUS.CANCELED]: { label: "Canceled", cls: "bg-red-50 text-red-600 border-red-200" },
+  };
+  const s = map[status] || map[EVENT_STATUS.PUBLISHED];
+  return (
+    <span className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-semibold ${s.cls}`}>
+      <span className="w-1.5 h-1.5 rounded-full bg-current opacity-70" />
+      {s.label}
+    </span>
+  );
+};
 
 const Modal = ({ children, onClose, icon, title, subtitle }) => (
   <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-sm flex items-center justify-center p-4 z-[1000]" onClick={onClose}>
