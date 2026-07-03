@@ -6,10 +6,7 @@ import { collection, query, where, onSnapshot } from "firebase/firestore";
 import { db } from "./firebase";
 import { EVENT_STATUS, effectiveStatus } from "./eventStatus";
 import { ipfsToHttp } from "./ipfs";
-
-const USD_PER_ETH = 3500;
-const usd = (eth) =>
-  `$${(parseFloat(eth || 0) * USD_PER_ETH).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+import { rm, ethLabel } from "./currency";
 
 // UNIX seconds -> "Saturday, Oct 14 at 8:00 PM"
 export function formatEventWindow(unixSec) {
@@ -170,8 +167,8 @@ const EventCard = ({ ev, onOpen }) => {
         <div className="flex items-end justify-between mt-4 pt-4 border-t border-slate-100">
           <div>
             <p className="text-xs text-slate-500">From</p>
-            <p className="text-xl font-bold text-slate-900">{parseFloat(ev.priceEth || 0).toFixed(3)} <span className="text-sm font-medium text-slate-400">ETH</span></p>
-            <p className="text-xs text-slate-400">≈ {usd(ev.priceEth)}</p>
+            <p className="text-xl font-bold text-slate-900">{rm(ev.priceEth)}</p>
+            <p className="text-xs text-slate-400">{ethLabel(ev.priceEth, 3)}</p>
           </div>
         </div>
 

@@ -12,10 +12,7 @@ import { CONTRACT_ABI, PUBLIC_RPC_URL, getContractAddress } from "./constants";
 import { formatEventWindow } from "./EventsHappening";
 import { ipfsToHttp } from "./ipfs";
 import { fetchProfile } from "./profileStore";
-
-const USD_PER_ETH = 3500;
-const usd = (eth) =>
-  `$${(Number(eth || 0) * USD_PER_ETH).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+import { rm, ethLabel } from "./currency";
 
 // Bounded-concurrency map — same reasoning as BuyerResellerDashboard: firing
 // hundreds of contract reads at once gets public RPCs to rate-limit and silently
@@ -357,8 +354,8 @@ const ResaleCard = ({ listing, isOwn, buying, disabled, onBuy }) => (
       <div className="flex items-end justify-between mt-4 pt-4 border-t border-slate-100">
         <div>
           <p className="inline-flex items-center gap-1.5 text-xs text-slate-500"><Tag size={13} className="text-slate-400" /> Resale price</p>
-          <p className="text-xl font-bold text-slate-900">{listing.resalePrice.toFixed(3)} <span className="text-sm font-medium text-slate-400">ETH</span></p>
-          <p className="text-xs text-slate-400">≈ {usd(listing.resalePrice)}</p>
+          <p className="text-xl font-bold text-slate-900">{rm(listing.resalePrice)}</p>
+          <p className="text-xs text-slate-400">{ethLabel(listing.resalePrice, 3)}</p>
         </div>
       </div>
 

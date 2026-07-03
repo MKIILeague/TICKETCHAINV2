@@ -6,7 +6,7 @@ import {
   Trash2, DollarSign, RefreshCw,
   Clock, CheckCircle2, XCircle, FileText, Building2, Mail, User, Tag, Search, Info, LogOut, Home,
   Wallet, Send, QrCode, Copy, Check, ExternalLink, LayoutDashboard, Users, UserPlus, ShieldCheck, X,
-  CalendarPlus, Plus
+  CalendarPlus, Plus, TrendingUp, BarChart3
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { CONTRACT_ADDRESS, CONTRACT_ABI, START_BLOCK, getContractAddress } from "./constants";
@@ -15,11 +15,8 @@ import { doc, setDoc, getDoc, deleteDoc, collection, query, where, getDocs } fro
 import { fetchOrgStatus, getCachedOrgStatus, setOrgStatusCache } from "./orgStatus";
 import { EVENT_STATUS, effectiveStatus } from "./eventStatus";
 import { ipfsToHttp } from "./ipfs";
+import { rm, ethLabel } from "./currency";
 import EventWizard from "./EventWizard";
-
-const USD_PER_ETH = 3500; // rough display-only conversion
-const usd = (eth) =>
-  `$${(parseFloat(eth || 0) * USD_PER_ETH).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 
 // ─── Registration Form ────────────────────────────────────────────────────────
 const RegistrationForm = ({ walletAddress, onSubmitted }) => {
@@ -226,6 +223,9 @@ const OrganizerDashboard = ({ walletAddress, wallet, connectWallet, logout, mode
   const [deployedStock, setDeployedStock] = useState(0);
   const [voidedCount, setVoidedCount] = useState(0);
   const [tickets, setTickets] = useState([]);
+  // Sales timeline — one point per on-chain TicketPurchased for this organizer's
+  // tickets: { id, price (ETH), t (unix seconds) }. Powers the overview graph.
+  const [salesSeries, setSalesSeries] = useState([]);
   // Off-chain event docs (the Firestore `sold` counter buyers see at checkout /
   // on the storefront). Merged into the on-chain stats so every view agrees.
   const [eventDocs, setEventDocs] = useState([]);
@@ -396,6 +396,33 @@ const OrganizerDashboard = ({ walletAddress, wallet, connectWallet, logout, mode
       setTickets(ticketList);
       setDeployedStock(ticketList.length);
       setVoidedCount(tempVoided);
+
+      // Sales timeline — every on-chain TicketPurchased for one of this
+      // organizer's tickets. The event isn't indexed by organizer, so we pull
+      // all purchases from startBlock and keep only the ids we minted above.
+      try {
+        const titleById = {};
+        ticketList.forEach((t) => { titleById[t.id] = (t.eventTitle || "").split(" #")[0]; });
+        const myIds = new Set(ticketList.map((t) => t.id));
+        const purchaseLogs = await contract.queryFilter(contract.filters.TicketPurchased(), startBlock);
+        const mine = purchaseLogs.filter((l) => myIds.has(l.args[0].toString()));
+        // Resolve block timestamps once per block to limit RPC round-trips.
+        const times = {};
+        await Promise.all([...new Set(mine.map((l) => l.blockNumber))].map(async (bn) => {
+          try { const b = await provider.getBlock(bn); times[bn] = Number(b?.timestamp) || 0; } catch { /* skip */ }
+        }));
+        const series = mine
+          .map((l) => ({
+            id: l.args[0].toString(),
+            title: titleById[l.args[0].toString()] || `Ticket #${l.args[0]}`,
+            price: parseFloat(ethers.formatEther(l.args[2] || 0n)),
+            t: times[l.blockNumber] || 0,
+          }))
+          .sort((a, b) => (a.t - b.t) || (Number(a.id) - Number(b.id)));
+        setSalesSeries(series);
+      } catch (salesErr) {
+        console.warn("Sales timeline load failed:", salesErr?.message);
+      }
 
       // Pull the off-chain sold counters in the same refresh so the dashboard's
       // "sold / total" stays in sync with the storefront and checkout pages.
@@ -848,9 +875,23 @@ const OrganizerDashboard = ({ walletAddress, wallet, connectWallet, logout, mode
           {section === "overview" && (
             <div className="space-y-8 max-w-6xl">
               <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
-                <StatCard icon={<DollarSign />} label="Sales pool" value={`${parseFloat(totalRevenue).toFixed(3)} ETH`} sub="Escrowed in contract" color="indigo" />
+                <StatCard icon={<DollarSign />} label="Sales pool" value={rm(totalRevenue)} sub={`${ethLabel(totalRevenue, 3)} escrowed`} color="indigo" />
                 <StatCard icon={<TicketIcon />} label="Tickets sold" value={`${totalSold} / ${totalMinted}`} sub="Across all events" color="emerald" />
                 <StatCard icon={<ShieldAlert />} label="Active events" value={`${eventStats.length}`} sub="Published & live" color="amber" />
+              </div>
+
+              {/* Sales polygraph — every on-chain ticket purchase over time */}
+              <div className="bg-white border border-slate-200 rounded-2xl shadow-sm p-5 sm:p-6">
+                <div className="flex items-center gap-2 mb-4">
+                  <div className="w-8 h-8 rounded-lg bg-indigo-50 text-indigo-600 flex items-center justify-center">
+                    <TrendingUp size={16} />
+                  </div>
+                  <div>
+                    <h3 className="text-base font-semibold text-slate-900">Sales activity</h3>
+                    <p className="text-xs text-slate-500">On-chain purchases · price and time per ticket</p>
+                  </div>
+                </div>
+                <SalesChart series={salesSeries} />
               </div>
 
               <div>
@@ -893,7 +934,7 @@ const OrganizerDashboard = ({ walletAddress, wallet, connectWallet, logout, mode
                                   <EventStatusBadge status={ev.status} />
                                 </div>
                                 <p className="text-xs text-slate-500 mt-0.5">
-                                  {ev.price} ETH / ticket{dateLabel ? ` · ${dateLabel}` : ""}
+                                  {rm(ev.price)} <span className="text-slate-400">({ethLabel(ev.price, 3)})</span> / ticket{dateLabel ? ` · ${dateLabel}` : ""}
                                 </p>
                               </div>
                             </div>
@@ -977,7 +1018,7 @@ const OrganizerDashboard = ({ walletAddress, wallet, connectWallet, logout, mode
                         <RefreshCw size={16} className={isFetchingBalance ? "animate-spin" : ""} />
                       </button>
                     </div>
-                    <p className="text-sm text-slate-500 mt-1">≈ {usd(ethBalance)}</p>
+                    <p className="text-sm text-slate-500 mt-1">≈ {rm(ethBalance)}</p>
                   </div>
                   <div className="flex items-center justify-between gap-4 pt-5 border-t border-slate-200">
                     <div className="min-w-0">
@@ -1044,7 +1085,7 @@ const OrganizerDashboard = ({ walletAddress, wallet, connectWallet, logout, mode
                   <div>
                     <p className="text-sm text-slate-500">Available to withdraw</p>
                     <p className="text-2xl font-bold text-slate-900">{parseFloat(totalRevenue).toFixed(4)} <span className="text-base font-medium text-slate-400">ETH</span></p>
-                    <p className="text-xs text-slate-400">≈ {usd(totalRevenue)}</p>
+                    <p className="text-xs text-slate-400">≈ {rm(totalRevenue)}</p>
                   </div>
                 </div>
                 <button onClick={handleWithdraw} disabled={parseFloat(totalRevenue) <= 0 || isPaused || withdrawLoading} className="w-full bg-slate-900 hover:bg-slate-800 disabled:bg-slate-100 disabled:text-slate-400 text-white py-3.5 rounded-xl text-sm font-semibold transition-colors flex items-center justify-center gap-2">
@@ -1220,6 +1261,152 @@ const EventStatusBadge = ({ status }) => {
       <span className="w-1.5 h-1.5 rounded-full bg-current opacity-70" />
       {s.label}
     </span>
+  );
+};
+
+// Full date+time for a sale point (multiple sales can land on the same day).
+const formatSaleTime = (t) =>
+  t ? new Date(t * 1000).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }) : "—";
+
+// ─── Sales polygraph ─────────────────────────────────────────────────────────
+// A dependency-free SVG line chart of every on-chain ticket purchase. Toggle
+// between cumulative revenue (the line climbs with each sale) and the individual
+// price paid per sale. Hovering a point reveals the ticket, its price, and when
+// it sold. `series` is pre-sorted oldest→newest: [{ id, title, price, t }].
+const SalesChart = ({ series }) => {
+  const [metric, setMetric] = useState("revenue"); // "revenue" | "price"
+  const [hover, setHover] = useState(null);
+
+  const count = series.length;
+  const totalRevenue = series.reduce((a, s) => a + s.price, 0);
+
+  if (count === 0) {
+    return (
+      <div className="p-12 text-center">
+        <TrendingUp className="w-9 h-9 mx-auto mb-3 text-slate-300" />
+        <p className="text-sm text-slate-500 font-medium">No sales yet</p>
+        <p className="text-xs text-slate-400 mt-1">Every ticket purchase will plot here — price and time included.</p>
+      </div>
+    );
+  }
+
+  // viewBox geometry. The wrapper is locked to the same aspect ratio (8:3) so
+  // percentage-positioned HTML tooltips line up with the SVG coordinates.
+  const W = 640, H = 240, padL = 14, padR = 14, padT = 16, padB = 26;
+  const innerW = W - padL - padR, innerH = H - padT - padB;
+
+  let cum = 0;
+  const points = series.map((s, i) => {
+    cum += s.price;
+    return { ...s, i, ticketNo: i + 1, cumRevenue: cum, yVal: metric === "revenue" ? cum : s.price };
+  });
+  const maxY = Math.max(...points.map((p) => p.yVal), 1e-9);
+
+  const px = (i) => padL + (count === 1 ? innerW / 2 : (i / (count - 1)) * innerW);
+  const py = (v) => padT + innerH - (v / maxY) * innerH;
+
+  const linePath = points.map((p, i) => `${i === 0 ? "M" : "L"} ${px(i).toFixed(1)} ${py(p.yVal).toFixed(1)}`).join(" ");
+  const areaPath = `${linePath} L ${px(count - 1).toFixed(1)} ${(padT + innerH).toFixed(1)} L ${px(0).toFixed(1)} ${(padT + innerH).toFixed(1)} Z`;
+
+  const gridYs = [0, 0.5, 1];
+  const active = hover != null ? points[hover] : null;
+
+  return (
+    <div>
+      {/* header: summary + metric toggle */}
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4">
+        <div className="flex items-center gap-6">
+          <div>
+            <p className="text-xs text-slate-500">Tickets sold</p>
+            <p className="text-lg font-bold text-slate-900">{count.toLocaleString()}</p>
+          </div>
+          <div>
+            <p className="text-xs text-slate-500">Total revenue</p>
+            <p className="text-lg font-bold text-slate-900">{rm(totalRevenue)}</p>
+            <p className="text-[11px] text-slate-400">{ethLabel(totalRevenue, 3)}</p>
+          </div>
+        </div>
+        <div className="inline-flex rounded-lg border border-slate-200 bg-slate-50 p-0.5 text-xs font-semibold self-start">
+          <button
+            onClick={() => { setMetric("revenue"); setHover(null); }}
+            className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md transition-colors ${metric === "revenue" ? "bg-white text-indigo-600 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}
+          >
+            <TrendingUp size={13} /> Cumulative
+          </button>
+          <button
+            onClick={() => { setMetric("price"); setHover(null); }}
+            className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md transition-colors ${metric === "price" ? "bg-white text-indigo-600 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}
+          >
+            <BarChart3 size={13} /> Per sale
+          </button>
+        </div>
+      </div>
+
+      {/* chart */}
+      <div className="relative w-full aspect-[8/3]">
+        <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-full overflow-visible" preserveAspectRatio="xMidYMid meet">
+          <defs>
+            <linearGradient id="salesFill" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="#6366f1" stopOpacity="0.18" />
+              <stop offset="100%" stopColor="#6366f1" stopOpacity="0" />
+            </linearGradient>
+          </defs>
+
+          {/* horizontal gridlines + y labels */}
+          {gridYs.map((g) => {
+            const yy = padT + innerH - g * innerH;
+            return (
+              <g key={g}>
+                <line x1={padL} y1={yy} x2={W - padR} y2={yy} stroke="#e2e8f0" strokeWidth="1" strokeDasharray={g === 0 ? "0" : "4 4"} />
+                <text x={W - padR} y={yy - 4} textAnchor="end" className="fill-slate-400" fontSize="10">{rm(maxY * g)}</text>
+              </g>
+            );
+          })}
+
+          <path d={areaPath} fill="url(#salesFill)" />
+          <path d={linePath} fill="none" stroke="#6366f1" strokeWidth="2.5" strokeLinejoin="round" strokeLinecap="round" />
+
+          {/* active guide line */}
+          {active && (
+            <line x1={px(active.i)} y1={padT} x2={px(active.i)} y2={padT + innerH} stroke="#6366f1" strokeWidth="1" strokeDasharray="3 3" opacity="0.5" />
+          )}
+
+          {/* points + hover hit areas */}
+          {points.map((p) => (
+            <g key={p.i}>
+              <circle cx={px(p.i)} cy={py(p.yVal)} r={active && active.i === p.i ? 5 : 3} fill="#fff" stroke="#6366f1" strokeWidth="2" />
+              <circle
+                cx={px(p.i)} cy={py(p.yVal)} r="14" fill="transparent"
+                onMouseEnter={() => setHover(p.i)} onMouseLeave={() => setHover(null)}
+                style={{ cursor: "pointer" }}
+              />
+            </g>
+          ))}
+        </svg>
+
+        {/* hover tooltip (HTML overlay, positioned via viewBox percentages) */}
+        {active && (
+          <div
+            className="pointer-events-none absolute z-10 -translate-x-1/2 -translate-y-full"
+            style={{ left: `${(px(active.i) / W) * 100}%`, top: `${(py(active.yVal) / H) * 100 - 3}%` }}
+          >
+            <div className="rounded-lg bg-slate-900 text-white px-3 py-2 shadow-lg whitespace-nowrap">
+              <p className="text-xs font-semibold">{active.title}</p>
+              <p className="text-[11px] text-slate-300">Ticket #{active.id} · sale {active.ticketNo} of {count}</p>
+              <p className="text-sm font-bold mt-0.5">{rm(active.price)} <span className="text-[11px] font-medium text-slate-400">({ethLabel(active.price, 3)})</span></p>
+              {metric === "revenue" && <p className="text-[11px] text-emerald-300">Running total {rm(active.cumRevenue)}</p>}
+              <p className="text-[11px] text-slate-400 mt-0.5">{formatSaleTime(active.t)}</p>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* x-axis range */}
+      <div className="flex justify-between mt-2 text-[11px] text-slate-400">
+        <span>{formatSaleTime(points[0].t)}</span>
+        {count > 1 && <span>{formatSaleTime(points[count - 1].t)}</span>}
+      </div>
+    </div>
   );
 };
 

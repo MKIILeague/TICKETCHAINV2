@@ -12,9 +12,7 @@ import { EVENT_STATUS, effectiveStatus, isSaleBlocked } from "./eventStatus";
 import { ipfsToHttp } from "./ipfs";
 import { formatEventWindow } from "./EventsHappening";
 
-const USD_PER_ETH = 3500;
-const usd = (eth) =>
-  `$${(Number(eth || 0) * USD_PER_ETH).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+import { rm, ethLabel } from "./currency";
 
 /**
  * Single-event checkout (route /event/:eventId) with multi-quantity purchase.
@@ -298,8 +296,8 @@ export default function EventCheckout({ walletAddress, wallet, connectWallet }) 
               <div className="flex items-end justify-between">
                 <div>
                   <p className="text-xs text-slate-500">Price per ticket</p>
-                  <p className="text-2xl font-bold text-slate-900">{price.toFixed(3)} <span className="text-base font-medium text-slate-400">ETH</span></p>
-                  <p className="text-xs text-slate-400">≈ {usd(price)}</p>
+                  <p className="text-2xl font-bold text-slate-900">{rm(price)}</p>
+                  <p className="text-xs text-slate-400">{ethLabel(price, 3)}</p>
                 </div>
                 <p className="inline-flex items-center gap-1.5 text-sm text-slate-500">
                   <Tag size={14} className="text-slate-400" />
@@ -334,14 +332,14 @@ export default function EventCheckout({ walletAddress, wallet, connectWallet }) 
               {/* cost breakdown */}
               <div className="rounded-xl bg-white border border-slate-200 p-4 text-sm">
                 <div className="flex items-center justify-between text-slate-600">
-                  <span>{qty} × {price.toFixed(3)} ETH</span>
-                  <span>{totalCost.toFixed(4)} ETH</span>
+                  <span>{qty} × {rm(price)}</span>
+                  <span>{rm(totalCost)}</span>
                 </div>
                 <div className="flex items-center justify-between mt-2 pt-2 border-t border-slate-100">
                   <span className="font-semibold text-slate-900">Total</span>
                   <span className="text-right">
-                    <span className="block font-bold text-slate-900">{totalCost.toFixed(4)} ETH</span>
-                    <span className="block text-xs text-slate-400">≈ {usd(totalCost)} · plus gas</span>
+                    <span className="block font-bold text-slate-900">{rm(totalCost)}</span>
+                    <span className="block text-xs text-slate-400">{ethLabel(totalCost)} · plus gas</span>
                   </span>
                 </div>
               </div>
@@ -371,7 +369,7 @@ export default function EventCheckout({ walletAddress, wallet, connectWallet }) 
                 >
                   {buying ? <><RefreshCw size={16} className="animate-spin" /> Processing…</>
                     : remaining <= 0 ? "Sold out"
-                    : <><Ticket size={16} /> Confirm purchase · {totalCost.toFixed(3)} ETH</>}
+                    : <><Ticket size={16} /> Confirm purchase · {rm(totalCost)}</>}
                 </button>
               )}
 

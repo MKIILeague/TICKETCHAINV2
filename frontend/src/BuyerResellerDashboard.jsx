@@ -13,10 +13,7 @@ import {
 } from "./eventStatus";
 import EventsHappening, { formatEventWindow } from "./EventsHappening";
 import { QRCodeSVG } from "qrcode.react";
-
-const USD_PER_ETH = 3500; // rough display-only conversion for the subtle/mainstream framing
-const usd = (eth) =>
-  `$${(parseFloat(eth || 0) * USD_PER_ETH).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+import { rm, ethLabel } from "./currency";
 
 // Run an async fn over items with bounded concurrency. Firing 100+ contract
 // reads in parallel gets public RPCs to rate-limit and silently drop responses,
@@ -162,12 +159,25 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
   const fetchDashboardData = async () => {
     setIsLoadingTickets(true);
     try {
-      // 1) Which chain is the embedded wallet on? (defaults to Sepolia)
+      // 1) Which chain do we read from? The app is Sepolia-only (see main.jsx
+      //    `supportedChains`). We only honour the local Hardhat node (31337) when
+      //    actually developing locally. Otherwise a connected injected wallet
+      //    (e.g. MetaMask) sitting on a Hardhat network would make us query
+      //    http://127.0.0.1:8545, whose accounts are pre-funded with 10000 ETH —
+      //    that bogus "9999.99…" balance was leaking into "My Wallet". In a
+      //    deployed build we always resolve to Sepolia regardless of the wallet's
+      //    reported network.
+      const allowLocal = import.meta.env.DEV;
       let chainId = 11155111;
       if (wallet) {
         try {
           const eip1193Provider = await wallet.getEthereumProvider();
-          chainId = Number((await new ethers.BrowserProvider(eip1193Provider).getNetwork()).chainId);
+          const walletChain = Number((await new ethers.BrowserProvider(eip1193Provider).getNetwork()).chainId);
+          if (walletChain === 11155111 || (allowLocal && walletChain === 31337)) {
+            chainId = walletChain;
+          }
+          // Any other chain (mainnet, or a stray localhost node in production)
+          // falls through to Sepolia — the only network this app supports.
         } catch (e) {
           console.warn("Could not read wallet network, defaulting to Sepolia:", e?.message);
         }
@@ -303,7 +313,8 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
 
       const network = await provider.getNetwork();
       const currentChainId = Number(network.chainId);
-      const targetChainId = (currentChainId === 31337 || currentChainId === 11155111) ? currentChainId : 11155111;
+      // Sepolia-only in production; the local Hardhat node is a dev-only path.
+      const targetChainId = (import.meta.env.DEV && currentChainId === 31337) ? 31337 : 11155111;
 
       if (currentChainId !== targetChainId) {
         await wallet.switchChain(targetChainId);
@@ -345,7 +356,8 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
 
       const network = await provider.getNetwork();
       const currentChainId = Number(network.chainId);
-      const targetChainId = (currentChainId === 31337 || currentChainId === 11155111) ? currentChainId : 11155111;
+      // Sepolia-only in production; the local Hardhat node is a dev-only path.
+      const targetChainId = (import.meta.env.DEV && currentChainId === 31337) ? 31337 : 11155111;
 
       if (currentChainId !== targetChainId) {
         await wallet.switchChain(targetChainId);
@@ -389,7 +401,8 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
 
       const network = await provider.getNetwork();
       const currentChainId = Number(network.chainId);
-      const targetChainId = (currentChainId === 31337 || currentChainId === 11155111) ? currentChainId : 11155111;
+      // Sepolia-only in production; the local Hardhat node is a dev-only path.
+      const targetChainId = (import.meta.env.DEV && currentChainId === 31337) ? 31337 : 11155111;
 
       if (currentChainId !== targetChainId) {
         await wallet.switchChain(targetChainId);
@@ -516,7 +529,7 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
                     <RefreshCw size={16} className={isFetchingBalance ? "animate-spin" : ""} />
                   </button>
                 </div>
-                <p className="text-sm text-slate-500 mt-1">≈ {usd(ethBalance)}</p>
+                <p className="text-sm text-slate-500 mt-1">≈ {rm(ethBalance)}</p>
               </div>
 
               <div className="flex items-center justify-between gap-4 pt-5 border-t border-slate-200">
@@ -734,7 +747,7 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
           <Modal onClose={() => setResaleTicket(null)} icon={<Tag size={20} />} title="List for resale" subtitle="Anti-scalping cap applies">
             <p className="text-sm text-slate-600 leading-relaxed">
               To keep things fair, the price is capped at 110% of the original.
-              Maximum: <span className="font-semibold text-slate-900">{resaleMaxPrice.toFixed(4)} ETH</span>.
+              Maximum: <span className="font-semibold text-slate-900">{rm(resaleMaxPrice)}</span> <span className="text-slate-400">({ethLabel(resaleMaxPrice)})</span>.
             </p>
 
             <div>
@@ -747,8 +760,10 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
                 placeholder="0.00"
                 className={`w-full bg-white border rounded-xl py-3 px-4 text-sm text-slate-900 placeholder:text-slate-400 outline-none transition-all ${priceExceeded ? "border-red-400 focus:ring-2 focus:ring-red-100" : "border-slate-200 focus:border-indigo-500 focus:ring-2 focus:ring-indigo-100"}`}
               />
-              {priceExceeded && (
+              {priceExceeded ? (
                 <p className="text-red-600 text-xs mt-1.5">Above the 110% cap — lower the price to continue.</p>
+              ) : parseFloat(resalePriceInput) > 0 && (
+                <p className="text-slate-500 text-xs mt-1.5">Buyers see <span className="font-semibold text-slate-700">{rm(resalePriceInput)}</span></p>
               )}
             </div>
 
@@ -1065,7 +1080,7 @@ const TicketCard = ({ ticket, meta, status, owner, contractAddress, chainId, onR
           <div className="flex items-center justify-between">
             <span className="text-slate-500">{ticket.isListed ? "Listed for" : "Face value"}</span>
             <span className="font-semibold text-white">
-              {(ticket.isListed ? ticket.resalePrice : ticket.mintPrice).toFixed(3)} <span className="text-slate-400 font-normal">ETH</span>
+              {rm(ticket.isListed ? ticket.resalePrice : ticket.mintPrice)} <span className="text-slate-400 font-normal">({ethLabel(ticket.isListed ? ticket.resalePrice : ticket.mintPrice, 3)})</span>
             </span>
           </div>
           <div className="flex items-center justify-between">

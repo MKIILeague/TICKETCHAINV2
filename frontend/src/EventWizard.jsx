@@ -12,11 +12,9 @@ import {
   uploadFileToIPFS, uploadJSONToIPFS, isIpfsConfigured, ipfsToHttp
 } from "./ipfs";
 import { EVENT_STATUS, effectiveStatus, cancelEvent, softDeleteEvent } from "./eventStatus";
+import { rm, ethLabel } from "./currency";
 
 const CATEGORIES = ["Concert", "Sports", "Theatre", "Conference"];
-const USD_PER_ETH = 3500;
-const usd = (eth) =>
-  `$${(parseFloat(eth || 0) * USD_PER_ETH).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 
 const EMPTY = { headline: "", dateTime: "", category: "", venue: "", description: "", totalSupply: "", price: "" };
 
@@ -594,8 +592,8 @@ export default function EventWizard({ wallet, walletAddress, orgData, isPaused, 
             <div className="flex items-end justify-between mt-6 pt-5 border-t border-slate-100">
               <div>
                 <p className="text-xs text-slate-500">From</p>
-                <p className="text-2xl font-bold text-slate-900">{form.price ? parseFloat(form.price).toFixed(3) : "0.000"} <span className="text-base font-medium text-slate-400">ETH</span></p>
-                <p className="text-xs text-slate-400">≈ {usd(form.price)} · {qty} available</p>
+                <p className="text-2xl font-bold text-slate-900">{rm(form.price)}</p>
+                <p className="text-xs text-slate-400">{ethLabel(form.price, 3)} · {qty} available</p>
               </div>
               <button disabled className="px-6 py-3 bg-indigo-600/60 text-white rounded-xl font-semibold text-sm cursor-not-allowed inline-flex items-center gap-2">
                 <TicketIcon size={16} /> Buy ticket
@@ -713,6 +711,9 @@ export default function EventWizard({ wallet, walletAddress, orgData, isPaused, 
             <div>
               <label className={labelCls}><DollarSign size={15} className="text-indigo-600" /> Ticket price (ETH) *</label>
               <input type="number" min="0" step="any" value={form.price} onChange={set("price")} disabled={busy} placeholder="0.05" className={inputCls} />
+              {parseFloat(form.price) > 0 && (
+                <p className="mt-1.5 text-xs text-slate-500">Buyers see <span className="font-semibold text-slate-700">{rm(form.price)}</span> · settled on-chain in ETH</p>
+              )}
             </div>
           </div>
 
