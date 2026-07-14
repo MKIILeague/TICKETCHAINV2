@@ -1,4 +1,4 @@
-import { Navigate } from "react-router-dom";
+import { Link, Navigate } from "react-router-dom";
 import { useTicketWallet } from "./useTicketWallet";
 
 // Client-side route guard.
@@ -20,12 +20,17 @@ export default function RequireRole({ allow, children, redirectTo = "/" }) {
   if (!ready) return <Spinner />;
 
   if (!authenticated) {
+    // Never a dead end: bare full-screen routes (organizer/gatekeeper/admin)
+    // render this with no navbar, so it must offer its own way back home.
     return (
       <div style={{ minHeight: "60vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 16 }}>
         <p style={{ color: "#94a3b8", fontSize: 14 }}>Please sign in to continue.</p>
         <button onClick={login} style={{ padding: "10px 24px", backgroundColor: "#6366f1", color: "#fff", border: "none", borderRadius: 12, fontWeight: 900, fontSize: 12, textTransform: "uppercase", letterSpacing: "0.1em", cursor: "pointer" }}>
           Sign In
         </button>
+        <Link to="/" style={{ color: "#64748b", fontSize: 13, fontWeight: 600, textDecoration: "none" }}>
+          ← Back to home
+        </Link>
       </div>
     );
   }

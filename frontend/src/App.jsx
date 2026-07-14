@@ -1,12 +1,11 @@
 import React, { useState } from "react";
-import { BrowserRouter, Routes, Route, Outlet, NavLink, useNavigate } from "react-router-dom";
+import { BrowserRouter, Routes, Route, Outlet, NavLink, Navigate } from "react-router-dom";
 import { Ticket as TicketIcon, Wallet, LogIn, LogOut, Building2, Menu, X, User, Repeat } from "lucide-react";
 import { useTicketWallet } from "./useTicketWallet";
 import { useProfile } from "./useProfile";
 import RequireRole from "./RequireRole";
 import BuyerResellerDashboard from "./BuyerResellerDashboard";
 import EventCheckout from "./EventCheckout";
-import OrganizerLanding from "./OrganizerLanding";
 import OrganizerDashboard from "./OrganizerDashboard";
 import GatekeeperTerminal from "./GatekeeperTerminal";
 import SystemAdminConsole from "./SystemAdminConsole";
@@ -16,9 +15,13 @@ import ResaleMarketplace from "./ResaleMarketplace";
 
 // ─── Consumer navbar (UX only — real authority is on-chain) ──────────────────
 function Navbar() {
-  const { ready, authenticated, address, login, logout, isAdmin, isGatekeeper } = useTicketWallet();
+  const { ready, authenticated, address, login, logout, isAdmin, isGatekeeper, isOrganizer } = useTicketWallet();
   const { displayName } = useProfile(address);
   const [isOpen, setIsOpen] = useState(false);
+
+  // Approved organizers go straight to their dashboard — everyone else lands on
+  // the smart entry at /organizer (sign-in / register / status screens).
+  const organizerHref = isOrganizer ? "/organizer/dashboard" : "/organizer";
 
   // Avatar initial for the profile chip — use the first letter of the display
   // name when it's an actual name (not a 0x… address), else fall back to an icon.
@@ -63,7 +66,7 @@ function Navbar() {
             <span className="inline-flex items-center gap-1.5"><Repeat size={14} /> Resale</span>
           </NavLink>
           <NavLink to="/wallet" className={link}>Wallet</NavLink>
-          <NavLink to="/organizer" className={link}>
+          <NavLink to={organizerHref} className={link}>
             <span className="inline-flex items-center gap-1.5"><Building2 size={14} /> Organizer</span>
           </NavLink>
           {isAdmin && <NavLink to="/admin/dashboard" className={link}>Admin</NavLink>}
@@ -115,7 +118,7 @@ function Navbar() {
               </span>
             </NavLink>
           )}
-          <NavLink to="/organizer" onClick={() => setIsOpen(false)} className={mobileLink}>
+          <NavLink to={organizerHref} onClick={() => setIsOpen(false)} className={mobileLink}>
             <span className="inline-flex items-center gap-1.5"><Building2 size={16} /> Organizer</span>
           </NavLink>
           {isAdmin && <NavLink to="/admin/dashboard" onClick={() => setIsOpen(false)} className={mobileLink}>Admin Dashboard</NavLink>}
@@ -178,13 +181,9 @@ function EventCheckoutPage() {
   const p = useChainProps();
   return <EventCheckout {...p} />;
 }
-function OrganizerRegisterPage() {
+function OrganizerEntryPage() {
   const p = useChainProps();
-  return <OrganizerDashboard {...p} mode="register" />;
-}
-function OrganizerLoginPage() {
-  const p = useChainProps();
-  return <OrganizerDashboard {...p} mode="login" />;
+  return <OrganizerDashboard {...p} mode="entry" />;
 }
 function OrganizerDashboardPage() {
   const p = useChainProps();
@@ -212,14 +211,17 @@ export default function App() {
           <Route path="/resale" element={<ResalePage />} />
           <Route path="/wallet" element={<RequireRole allow={["buyer"]}><WalletPage /></RequireRole>} />
           <Route path="/profile" element={<RequireRole allow={["buyer"]}><Profile /></RequireRole>} />
-          <Route path="/organizer" element={<OrganizerLanding />} />
-          <Route path="/organizer/register" element={<RequireRole allow={["buyer"]}><OrganizerRegisterPage /></RequireRole>} />
-          <Route path="/organizer/login" element={<RequireRole allow={["buyer"]}><OrganizerLoginPage /></RequireRole>} />
+          {/* Single smart entry: sign-in / register / pending / rejected / → dashboard.
+              Handles the signed-out state itself, so no RequireRole wrapper. */}
+          <Route path="/organizer" element={<OrganizerEntryPage />} />
+          {/* Old bookmarks/links from the register/login split keep working */}
+          <Route path="/organizer/register" element={<Navigate to="/organizer" replace />} />
+          <Route path="/organizer/login" element={<Navigate to="/organizer" replace />} />
           <Route path="/admin/login" element={<AdminLogin />} />
         </Route>
 
         {/* Bare full-screen routes — no consumer navbar */}
-        <Route path="/organizer/dashboard" element={<RequireRole allow={["organizer"]} redirectTo="/organizer/login"><OrganizerDashboardPage /></RequireRole>} />
+        <Route path="/organizer/dashboard" element={<RequireRole allow={["organizer"]} redirectTo="/organizer"><OrganizerDashboardPage /></RequireRole>} />
         <Route path="/gatekeeper" element={<RequireRole allow={["gatekeeper"]}><GatekeeperPage /></RequireRole>} />
         <Route path="/admin/dashboard" element={<RequireRole allow={["admin"]} redirectTo="/admin/login"><AdminConsolePage /></RequireRole>} />
       </Routes>

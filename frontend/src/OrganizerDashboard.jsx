@@ -4,14 +4,15 @@ import { ethers } from "ethers";
 import {
   Landmark, ShieldAlert, Ticket as TicketIcon,
   Trash2, DollarSign, RefreshCw,
-  Clock, CheckCircle2, XCircle, FileText, Building2, Mail, User, Tag, Search, Info, LogOut, Home,
+  Clock, XCircle, FileText, Building2, Mail, User, Tag, Search, Info, LogOut, Home,
   Wallet, Send, QrCode, Copy, Check, ExternalLink, LayoutDashboard, Users, UserPlus, ShieldCheck, X,
   CalendarPlus, Plus, TrendingUp, BarChart3
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { CONTRACT_ABI, PUBLIC_RPC_URL, getContractAddress, getDeployments } from "./constants";
 import { db } from "./firebase";
-import { doc, setDoc, getDoc, deleteDoc, collection, query, where, getDocs } from "firebase/firestore";
+import { doc, setDoc, getDoc, deleteDoc, collection, query, where, getDocs, onSnapshot } from "firebase/firestore";
+import { usePrivy } from "@privy-io/react-auth";
 import { fetchOrgStatus, getCachedOrgStatus, setOrgStatusCache } from "./orgStatus";
 import { EVENT_STATUS, effectiveStatus } from "./eventStatus";
 import { ipfsToHttp } from "./ipfs";
@@ -20,8 +21,10 @@ import EventWizard from "./EventWizard";
 
 // ─── Registration Form ────────────────────────────────────────────────────────
 const RegistrationForm = ({ walletAddress, onSubmitted }) => {
+  const { user } = usePrivy();
   const [form, setForm] = useState({
-    legalName: "", organizationName: "", email: "", eventType: "", description: ""
+    // Prefill from the Privy login email — editable, most organisers use the same one.
+    legalName: "", organizationName: "", email: user?.email?.address || "", eventType: "", description: ""
   });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -56,9 +59,9 @@ const RegistrationForm = ({ walletAddress, onSubmitted }) => {
     } catch (err) {
       console.error("Registration failed:", err);
       if (err.message === "timeout") {
-        setError("Request timed out. Check your internet connection and that Firestore is in Test Mode.");
+        setError("Request timed out. Check your internet connection and try again.");
       } else if (err.code === "permission-denied") {
-        setError("Permission denied. Make sure Firestore is set to Test Mode in Firebase Console.");
+        setError("We couldn't save your application right now. Please try again later or contact support.");
       } else {
         setError(`Submission failed: ${err.message || "Unknown error"}`);
       }
@@ -183,7 +186,7 @@ const DetailRow = ({ label, value, valueClass = "text-slate-900" }) => (
   </div>
 );
 
-const PendingScreen = ({ orgData }) => (
+const PendingScreen = ({ orgData, walletAddress }) => (
   <StatusScreen tone="amber" icon={<Clock size={40} className="animate-pulse" />} title="Application pending"
     details={
       <>
@@ -191,10 +194,13 @@ const PendingScreen = ({ orgData }) => (
         <DetailRow label="Organisation" value={orgData?.organizationName} />
         <DetailRow label="Event type" value={orgData?.eventType} valueClass="text-amber-600" />
         <DetailRow label="Status" value="Pending review" valueClass="text-amber-600" />
+        {walletAddress && (
+          <DetailRow label="Wallet" value={`${walletAddress.slice(0, 6)}…${walletAddress.slice(-4)}`} valueClass="text-slate-700 font-mono" />
+        )}
       </>
     }>
     Your organiser application for <span className="text-slate-900 font-semibold">{orgData?.organizationName}</span> is
-    under review. An admin will approve or reject it shortly.
+    under review. This page updates automatically the moment an admin approves you — no need to refresh.
   </StatusScreen>
 );
 
@@ -230,10 +236,16 @@ const OrganizerDashboard = ({ walletAddress, wallet, connectWallet, logout, mode
   // on the storefront). Merged into the on-chain stats so every view agrees.
   const [eventDocs, setEventDocs] = useState([]);
   const [searchQuery, setSearchQuery] = useState("");
+  // Overview event list filter: live | past | canceled | all. Defaults to live —
+  // "Active events" should mean events actually on sale, not the full history.
+  const [eventFilter, setEventFilter] = useState("live");
   const [withdrawLoading, setWithdrawLoading] = useState(false);
   const [voidingTickets, setVoidingTickets] = useState({});
   const [activeChainId, setActiveChainId] = useState(11155111);
   const [localhostFaucetLoading, setLocalhostFaucetLoading] = useState(false);
+  // Firestore "approved" is only the UI signal — the contract whitelist is the
+  // real mint gate. null = unknown (read unavailable), true/false = on-chain truth.
+  const [onChainWhitelisted, setOnChainWhitelisted] = useState(null);
 
   // Wallet states
   const [ethBalance, setEthBalance] = useState("0.00");
@@ -278,6 +290,14 @@ const OrganizerDashboard = ({ walletAddress, wallet, connectWallet, logout, mode
     } finally {
       setLocalhostFaucetLoading(false);
     }
+  };
+
+  // Leave the guarded route FIRST (replace, so Back can't return to the dead
+  // dashboard entry), THEN clear the Privy session — otherwise the RequireRole
+  // "Please sign in" card flashes on the bare full-screen route with no way out.
+  const handleLogout = async () => {
+    navigate("/", { replace: true });
+    try { await logout?.(); } catch (err) { console.warn("Logout failed:", err?.message); }
   };
 
   const handleCopyAddress = () => {
@@ -337,6 +357,25 @@ const OrganizerDashboard = ({ walletAddress, wallet, connectWallet, logout, mode
     checkOrgStatus();
   }, [walletAddress]);
 
+  // While the application is pending, listen to the organiser doc live so an
+  // admin approval flips this screen into the dashboard without a manual reload.
+  useEffect(() => {
+    if (!walletAddress || orgStatus !== "pending") return;
+    const unsub = onSnapshot(
+      doc(db, "organisers", walletAddress),
+      (snap) => {
+        if (!snap.exists()) return;
+        const data = snap.data();
+        const status = data.status || "pending";
+        setOrgStatusCache(walletAddress, status, data);
+        setOrgData(data);
+        setOrgStatus(status);
+      },
+      (err) => console.warn("Org status listener failed:", err?.message)
+    );
+    return unsub;
+  }, [walletAddress, orgStatus]);
+
   const fetchDashboardData = async () => {
     if (!walletAddress) return;
 
@@ -390,6 +429,13 @@ const OrganizerDashboard = ({ walletAddress, wallet, connectWallet, logout, mode
       const deployments = getDeployments(currentChainId);
       const primaryContract = new ethers.Contract(deployments[0].address, CONTRACT_ABI, provider);
       setIsPaused(await primaryContract.paused().catch(() => false));
+
+      // Surface a missing on-chain whitelist NOW (banner) instead of letting the
+      // organizer discover it as a cryptic revert at mint time. Admin approval is
+      // two-part: Firestore status + whitelistOrganizer tx — the tx can fail.
+      try {
+        setOnChainWhitelisted(await primaryContract.whitelistedOrganizers(walletAddress));
+      } catch { setOnChainWhitelisted(null); /* read failed — don't show a false alarm */ }
 
       // Withdrawable on-chain vault (credited only in a real-payment build;
       // stays 0 in the zero-value demo). Separate from the "sales pool" stat,
@@ -707,10 +753,25 @@ const OrganizerDashboard = ({ walletAddress, wallet, connectWallet, logout, mode
       }
     });
 
-    return Object.values(groups).sort((a, b) => b.total - a.total);
+    // Live first, then past, then canceled; biggest events first within a group
+    // (matters for the "All" tab, and keeps any single-status list stable).
+    const order = { [EVENT_STATUS.PUBLISHED]: 0, [EVENT_STATUS.FINISHED]: 1, [EVENT_STATUS.CANCELED]: 2 };
+    return Object.values(groups).sort((a, b) => (order[a.status] ?? 0) - (order[b.status] ?? 0) || b.total - a.total);
   }, [tickets, me, eventDocs]);
 
-  const filteredEvents = eventStats.filter((e) => e.title.toLowerCase().includes(searchQuery.toLowerCase()));
+  // Split by lifecycle so "Active events" really means live. Past and canceled
+  // events stay reachable through the tabs instead of being mixed in.
+  const liveEvents = eventStats.filter((e) => e.status === EVENT_STATUS.PUBLISHED);
+  const pastEvents = eventStats.filter((e) => e.status === EVENT_STATUS.FINISHED);
+  const canceledEvents = eventStats.filter((e) => e.status === EVENT_STATUS.CANCELED);
+  const eventTabs = [
+    { id: "live", label: "Live", list: liveEvents },
+    { id: "past", label: "Past", list: pastEvents },
+    { id: "canceled", label: "Canceled", list: canceledEvents },
+    { id: "all", label: "All", list: eventStats },
+  ];
+  const currentTab = eventTabs.find((t) => t.id === eventFilter) ?? eventTabs[0];
+  const filteredEvents = currentTab.list.filter((e) => e.title.toLowerCase().includes(searchQuery.toLowerCase()));
   const totalSold = eventStats.reduce((a, e) => a + e.sold, 0);
   const totalMinted = eventStats.reduce((a, e) => a + e.total, 0);
   // Gross sales value = Σ (tickets sold × face price), computed DIRECTLY from the
@@ -761,24 +822,20 @@ const OrganizerDashboard = ({ walletAddress, wallet, connectWallet, logout, mode
     );
   }
 
-  // ── Not signed in → organizer-specific sign-in (copy differs per page) ──
+  // ── Not signed in → single organizer sign-in (entry works out the rest) ──
   if (!walletAddress) {
-    const isRegister = mode === "register";
     return (
       <Card>
         <div className="w-14 h-14 mx-auto mb-5 bg-indigo-600 rounded-2xl flex items-center justify-center">
           <Building2 className="text-white w-7 h-7" />
         </div>
-        <h1 className="text-xl font-bold tracking-tight text-slate-900 mb-2">
-          {isRegister ? "Register as an organizer" : "Organizer login"}
-        </h1>
+        <h1 className="text-xl font-bold tracking-tight text-slate-900 mb-2">Organizer portal</h1>
         <p className="text-slate-500 text-sm mb-6 leading-relaxed">
-          {isRegister
-            ? "Sign in to create your organizer account, then submit your organisation details for admin review."
-            : "Sign in to your organizer account to access your dashboard."}
+          Sign in to manage your events. New here? Sign in first — you can register your
+          organisation right after, and an admin approves it before you can issue tickets.
         </p>
         <button onClick={connectWallet} className="w-full px-8 py-3.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl font-semibold text-sm transition-colors">
-          {isRegister ? "Sign in to register" : "Sign in"}
+          Sign in
         </button>
       </Card>
     );
@@ -811,50 +868,18 @@ const OrganizerDashboard = ({ walletAddress, wallet, connectWallet, logout, mode
     );
   }
 
-  // ── REGISTRATION PAGE (/organizer/register) ──
-  if (mode === "register") {
+  // ── ENTRY (/organizer) — one smart page: the status decides what renders ──
+  if (mode !== "dashboard") {
     if (orgStatus === "unregistered")
       return <RegistrationForm walletAddress={walletAddress} onSubmitted={() => { setOrgStatusCache(walletAddress, "pending"); setOrgStatus("pending"); checkOrgStatus(); }} />;
-    if (orgStatus === "pending") return <PendingScreen orgData={orgData} />;
+    if (orgStatus === "pending") return <PendingScreen orgData={orgData} walletAddress={walletAddress} />;
     if (orgStatus === "rejected") return <RejectedScreen orgData={orgData} />;
-    // Already approved → direct them to the login page.
-    return (
-      <Card>
-        <div className="w-14 h-14 mx-auto mb-5 bg-emerald-50 border border-emerald-200 rounded-2xl flex items-center justify-center">
-          <CheckCircle2 className="text-emerald-500 w-7 h-7" />
-        </div>
-        <h1 className="text-xl font-bold tracking-tight text-slate-900 mb-2">Already registered</h1>
-        <p className="text-slate-500 text-sm mb-6 leading-relaxed">Your organisation is already approved. Use the organizer login to access your dashboard.</p>
-        <button onClick={() => navigate("/organizer/login")} className="w-full px-8 py-3.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl font-semibold text-sm transition-colors">
-          Go to organizer login →
-        </button>
-      </Card>
-    );
-  }
-
-  // ── LOGIN PAGE (/organizer/login) ──
-  if (mode === "login") {
-    if (orgStatus === "unregistered")
-      return (
-        <Card>
-          <div className="w-14 h-14 mx-auto mb-5 bg-amber-50 border border-amber-200 rounded-2xl flex items-center justify-center">
-            <FileText className="text-amber-500 w-7 h-7" />
-          </div>
-          <h1 className="text-xl font-bold tracking-tight text-slate-900 mb-2">No organizer account</h1>
-          <p className="text-slate-500 text-sm mb-6 leading-relaxed">This account hasn't registered as an organizer yet. Register first, then wait for an admin to approve you.</p>
-          <button onClick={() => navigate("/organizer/register")} className="w-full px-8 py-3.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl font-semibold text-sm transition-colors">
-            Register as organizer →
-          </button>
-        </Card>
-      );
-    if (orgStatus === "pending") return <PendingScreen orgData={orgData} />;
-    if (orgStatus === "rejected") return <RejectedScreen orgData={orgData} />;
-    // Approved → go straight into the dashboard (no confirmation step).
+    // Approved → straight into the dashboard, no extra clicks.
     return <Navigate to="/organizer/dashboard" replace />;
   }
 
   // ── DASHBOARD (mode === "dashboard") — safety net if not approved ──
-  if (orgStatus !== "approved") return <Navigate to="/organizer/login" replace />;
+  if (orgStatus !== "approved") return <Navigate to="/organizer" replace />;
 
   // ── Approved: Full Dashboard (sidebar layout) ──
   const navItems = [
@@ -895,7 +920,7 @@ const OrganizerDashboard = ({ walletAddress, wallet, connectWallet, logout, mode
             <Home size={18} /> Back to site
           </button>
           {logout && (
-            <button onClick={logout} className="flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium text-slate-600 hover:bg-red-50 hover:text-red-600 transition-colors">
+            <button onClick={handleLogout} className="flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium text-slate-600 hover:bg-red-50 hover:text-red-600 transition-colors">
               <LogOut size={18} /> Log out
             </button>
           )}
@@ -917,7 +942,7 @@ const OrganizerDashboard = ({ walletAddress, wallet, connectWallet, logout, mode
             </span>
             {/* mobile-only logout (sidebar's is hidden on mobile) */}
             {logout && (
-              <button onClick={logout} className="md:hidden p-2 rounded-lg text-slate-500 hover:text-red-600 hover:bg-red-50 transition-colors">
+              <button onClick={handleLogout} className="md:hidden p-2 rounded-lg text-slate-500 hover:text-red-600 hover:bg-red-50 transition-colors">
                 <LogOut size={18} />
               </button>
             )}
@@ -926,13 +951,34 @@ const OrganizerDashboard = ({ walletAddress, wallet, connectWallet, logout, mode
 
         <main className="p-6 sm:p-8 animate-in fade-in duration-300">
 
+          {/* Approved in Firestore but missing from the contract whitelist — the
+              admin's whitelistOrganizer tx failed or hasn't landed. Warn here
+              instead of letting mints fail with an opaque revert. */}
+          {onChainWhitelisted === false && (
+            <div className="mb-6 max-w-6xl flex items-start gap-3 p-4 bg-amber-50 border border-amber-200 rounded-xl">
+              <ShieldAlert className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+              <div>
+                <p className="text-sm font-semibold text-amber-800">On-chain activation still pending</p>
+                <p className="text-sm text-amber-700 leading-relaxed">
+                  Your account is approved, but your wallet hasn't been whitelisted on the {networkLabel} contract
+                  yet — creating events and minting tickets will fail until that completes. Please contact the
+                  admin to finish your on-chain approval.
+                </p>
+              </div>
+            </div>
+          )}
+
           {/* ───────────── OVERVIEW ───────────── */}
           {section === "overview" && (
             <div className="space-y-8 max-w-6xl">
               <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
                 <StatCard icon={<DollarSign />} label="Sales pool" value={rm(salesRevenue)} sub={`${ethLabel(salesRevenue, 3)} · ${totalSold} sold`} color="indigo" />
                 <StatCard icon={<TicketIcon />} label="Tickets sold" value={`${totalSold} / ${totalMinted}`} sub="Across all events" color="emerald" />
-                <StatCard icon={<ShieldAlert />} label="Active events" value={`${eventStats.length}`} sub="Published & live" color="amber" />
+                <StatCard icon={<ShieldAlert />} label="Active events" value={`${liveEvents.length}`}
+                  sub={pastEvents.length || canceledEvents.length
+                    ? [pastEvents.length && `${pastEvents.length} past`, canceledEvents.length && `${canceledEvents.length} canceled`].filter(Boolean).join(" · ")
+                    : "On sale now"}
+                  color="amber" />
               </div>
 
               {/* Sales polygraph — every on-chain ticket purchase over time */}
@@ -954,13 +1000,29 @@ const OrganizerDashboard = ({ walletAddress, wallet, connectWallet, logout, mode
                 <div className="bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden flex flex-col self-start">
                   <div className="p-5 border-b border-slate-100 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
                     <div className="flex items-center gap-3">
-                      <h3 className="text-base font-semibold text-slate-900">Active events</h3>
-                      <span className="text-xs text-slate-500">{eventStats.length} published</span>
+                      <h3 className="text-base font-semibold text-slate-900">Your events</h3>
+                      <span className="text-xs text-slate-500">
+                        {currentTab.list.length} {currentTab.id === "all" ? "total" : currentTab.label.toLowerCase()}
+                      </span>
                     </div>
                     <button onClick={() => setSection("events")} className="inline-flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-sm font-semibold transition-colors">
                       <Plus size={15} /> New event
                     </button>
                   </div>
+                  {/* Lifecycle tabs — only shown once there's history beyond live events */}
+                  {(pastEvents.length > 0 || canceledEvents.length > 0) && (
+                    <div className="px-4 pt-4 flex items-center gap-1.5 flex-wrap">
+                      {eventTabs.filter((t) => t.id === "live" || t.list.length > 0).map((t) => (
+                        <button key={t.id} onClick={() => setEventFilter(t.id)}
+                          className={`px-3 py-1.5 rounded-lg text-xs font-semibold border transition-colors ${
+                            eventFilter === t.id
+                              ? "bg-indigo-600 border-indigo-600 text-white"
+                              : "bg-white border-slate-200 text-slate-600 hover:border-indigo-300 hover:text-slate-900"}`}>
+                          {t.label} <span className={eventFilter === t.id ? "text-indigo-200" : "text-slate-400"}>{t.list.length}</span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
                   {eventStats.length > 0 && (
                     <div className="p-4 border-b border-slate-100">
                       <div className="relative">
@@ -1009,10 +1071,18 @@ const OrganizerDashboard = ({ walletAddress, wallet, connectWallet, logout, mode
                         </div>
                       );
                     })}
-                    {eventStats.length > 0 && filteredEvents.length === 0 && (
+                    {eventStats.length > 0 && filteredEvents.length === 0 && searchQuery && (
                       <div className="p-16 text-center text-slate-400">
                         <Search className="w-9 h-9 mx-auto mb-3 opacity-30" />
                         <p className="text-sm">No events match “{searchQuery}”.</p>
+                      </div>
+                    )}
+                    {eventStats.length > 0 && filteredEvents.length === 0 && !searchQuery && (
+                      <div className="p-16 text-center text-slate-400">
+                        <TicketIcon className="w-9 h-9 mx-auto mb-3 opacity-30" />
+                        <p className="text-sm">
+                          {currentTab.id === "live" ? "No live events right now." : `No ${currentTab.label.toLowerCase()} events.`}
+                        </p>
                       </div>
                     )}
                     {eventStats.length === 0 && (
