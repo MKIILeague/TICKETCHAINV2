@@ -5,7 +5,7 @@ import {
   Wallet, Send, Tag, Search, Compass, MapPin,
   Clock, RefreshCw, Copy, Check, ExternalLink, QrCode, Info,
   Ticket, ShieldCheck, ArrowRight, Zap, X, Ban, CheckCircle2,
-  CalendarClock, AlertTriangle, History
+  CalendarClock, AlertTriangle, History, ChevronLeft, ChevronRight
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { CONTRACT_ABI, PUBLIC_RPC_URL, getContractAddress, getDeployments } from "./constants";
@@ -13,6 +13,9 @@ import {
   EVENT_STATUS, normalizeEventName, isTransferFrozen, fetchPublicEventStatusMap
 } from "./eventStatus";
 import EventsHappening, { formatEventWindow } from "./EventsHappening";
+import heroSlideConfetti from "./assets/slides/slide3.jpeg";
+import heroSlideStage from "./assets/slides/slide1.jpg";
+import heroSlideAerial from "./assets/slides/slide2.jpeg";
 import { QRCodeSVG } from "qrcode.react";
 import { rm, ethLabel } from "./currency";
 
@@ -796,39 +799,8 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
       ) : (
         /* ─────────────────────── MARKETPLACE / LANDING ───────────────────── */
         <>
-          {/* Hero */}
-          <section className="border-b border-slate-200 bg-gradient-to-b from-indigo-100/70 via-indigo-50/40 to-slate-100">
-            <div className="max-w-7xl mx-auto px-6 sm:px-10 py-16 sm:py-24">
-              <div className="max-w-2xl">
-                <span className="inline-flex items-center gap-2 rounded-full bg-white border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-600 mb-6">
-                  <ShieldCheck size={14} className="text-indigo-600" /> Powered by Ethereum
-                </span>
-                <h1 className="text-4xl sm:text-5xl font-bold tracking-tight text-slate-900 leading-[1.1]">
-                  Tickets you<br className="hidden sm:block" /> actually own.
-                </h1>
-                <p className="mt-5 text-lg text-slate-600 leading-relaxed">
-                  Buy, sell, and transfer event tickets that live on the blockchain — no fakes,
-                  no scalping, and they're always yours.
-                </p>
-                <div className="mt-8 flex flex-wrap items-center gap-3">
-                  <a href="#events" className="inline-flex items-center gap-2 px-6 py-3 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl font-semibold transition-colors">
-                    Browse events <ArrowRight size={17} />
-                  </a>
-                  {!walletAddress && (
-                    <button onClick={connectWallet} className="inline-flex items-center gap-2 px-6 py-3 bg-white border border-slate-200 hover:bg-slate-50 text-slate-700 rounded-xl font-semibold transition-colors">
-                      Connect wallet
-                    </button>
-                  )}
-                </div>
-
-                <div className="mt-12 flex flex-wrap gap-x-8 gap-y-4">
-                  <Feature icon={ShieldCheck} title="Verified on-chain" desc="Every ticket is a unique token" />
-                  <Feature icon={Tag} title="Fair resale" desc="Capped at 110% of face value" />
-                  <Feature icon={Zap} title="Instant transfer" desc="Send to anyone in seconds" />
-                </div>
-              </div>
-            </div>
-          </section>
+          {/* Hero — 3-slide crossfading showcase */}
+          <HeroSlideshow walletAddress={walletAddress} connectWallet={connectWallet} />
 
           {/* Events Happening — Firestore-driven storefront grid */}
           <EventsHappening />
@@ -1069,14 +1041,130 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
 
 /* ─────────────────────────── Sub-components ─────────────────────────── */
 
+// ─── Hero slideshow (landing page) ───────────────────────────────────────────
+// Three rotating slides, each pairing one of the crowd/stage photos with one
+// core promise. Auto-advances, pauses on hover, arrows/dots for manual control.
+const HERO_SLIDES = [
+  {
+    img: heroSlideConfetti,
+    title: (
+      <>Real tickets.<br className="hidden sm:block" />{" "}
+        <span className="bg-gradient-to-r from-indigo-400 to-violet-400 bg-clip-text text-transparent">Really yours.</span></>
+    ),
+    sub: "Every ticket here is a unique token on Ethereum — impossible to counterfeit, protected from scalpers, and yours to keep, send, or resell the moment you buy.",
+  },
+  {
+    img: heroSlideStage,
+    title: (
+      <>Fair prices,<br className="hidden sm:block" />{" "}
+        <span className="bg-gradient-to-r from-indigo-400 to-violet-400 bg-clip-text text-transparent">enforced by code.</span></>
+    ),
+    sub: "Resale is capped at 110% of face value by the contract itself — good seats change hands without the scalper tax.",
+  },
+  {
+    img: heroSlideAerial,
+    title: (
+      <>Your phone<br className="hidden sm:block" />{" "}
+        <span className="bg-gradient-to-r from-indigo-400 to-violet-400 bg-clip-text text-transparent">is the ticket.</span></>
+    ),
+    sub: "A live QR code gets you through the gate in seconds — and sending a spare ticket to a friend is just as fast.",
+  },
+];
+
+const HeroSlideshow = ({ walletAddress, connectWallet }) => {
+  const [index, setIndex] = useState(0);
+  const [paused, setPaused] = useState(false);
+
+  // Auto-advance; keyed on index so any manual jump restarts the full delay.
+  useEffect(() => {
+    if (paused) return;
+    const t = setTimeout(() => setIndex((i) => (i + 1) % HERO_SLIDES.length), 6000);
+    return () => clearTimeout(t);
+  }, [index, paused]);
+
+  const go = (i) => setIndex((i + HERO_SLIDES.length) % HERO_SLIDES.length);
+  const slide = HERO_SLIDES[index];
+
+  return (
+    <section
+      className="relative overflow-hidden border-b border-slate-200 bg-slate-950"
+      onMouseEnter={() => setPaused(true)}
+      onMouseLeave={() => setPaused(false)}
+    >
+      {/* All slides stay mounted and crossfade — no flash on first rotation */}
+      {HERO_SLIDES.map((s, i) => (
+        <img key={i} src={s.img} alt="" aria-hidden
+          className={`absolute inset-0 w-full h-full object-cover transition-opacity duration-1000 ${i === index ? "opacity-100" : "opacity-0"}`} />
+      ))}
+      {/* Legibility scrims over the photos */}
+      <div className="absolute inset-0 bg-gradient-to-r from-slate-950/90 via-slate-950/60 to-slate-950/25" />
+      <div className="absolute inset-0 bg-gradient-to-t from-slate-950/70 via-transparent to-slate-950/30" />
+
+      <div className="relative max-w-7xl mx-auto px-6 sm:px-10 py-16 sm:py-24">
+        <div className="max-w-2xl">
+          <span className="inline-flex items-center gap-2 rounded-full bg-white/10 backdrop-blur border border-white/20 px-3 py-1.5 text-xs font-medium text-slate-100 mb-6">
+            <ShieldCheck size={14} className="text-indigo-300" /> Powered by Ethereum
+          </span>
+
+          {/* Message swaps with the photo */}
+          <AnimatePresence mode="wait">
+            <motion.div key={index}
+              initial={{ opacity: 0, y: 14 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }}
+              transition={{ duration: 0.35 }}
+              className="min-h-[180px] sm:min-h-[190px]">
+              <h1 className="text-4xl sm:text-5xl font-bold tracking-tight text-white leading-[1.1]">{slide.title}</h1>
+              <p className="mt-5 text-lg text-slate-300 leading-relaxed">{slide.sub}</p>
+            </motion.div>
+          </AnimatePresence>
+
+          <div className="mt-6 flex flex-wrap items-center gap-3">
+            <a href="#events" className="inline-flex items-center gap-2 px-6 py-3 bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-500 hover:to-violet-500 text-white rounded-xl font-semibold shadow-lg shadow-indigo-950/40 transition-all">
+              Browse events <ArrowRight size={17} />
+            </a>
+            {!walletAddress && (
+              <button onClick={connectWallet} className="inline-flex items-center gap-2 px-6 py-3 bg-white/10 backdrop-blur border border-white/25 hover:bg-white/20 text-white rounded-xl font-semibold transition-colors">
+                Connect wallet
+              </button>
+            )}
+          </div>
+
+          <div className="mt-12 flex flex-wrap gap-x-8 gap-y-4">
+            <Feature icon={ShieldCheck} title="Impossible to fake" desc="Every ticket is a one-of-a-kind token" />
+            <Feature icon={Tag} title="Fair resale, always" desc="Prices capped at 110% of face value" />
+            <Feature icon={Zap} title="Instant transfers" desc="Send a ticket to a friend in seconds" />
+          </div>
+
+          {/* Slide controls */}
+          <div className="mt-10 flex items-center gap-2.5">
+            {HERO_SLIDES.map((_, i) => (
+              <button key={i} onClick={() => go(i)} aria-label={`Go to slide ${i + 1}`}
+                className={`h-1.5 rounded-full transition-all duration-300 ${i === index ? "w-8 bg-white" : "w-4 bg-white/35 hover:bg-white/60"}`} />
+            ))}
+            <div className="ml-4 flex gap-2">
+              <button onClick={() => go(index - 1)} aria-label="Previous slide"
+                className="w-8 h-8 rounded-full bg-white/10 backdrop-blur border border-white/20 hover:bg-white/25 text-white flex items-center justify-center transition-colors">
+                <ChevronLeft size={16} />
+              </button>
+              <button onClick={() => go(index + 1)} aria-label="Next slide"
+                className="w-8 h-8 rounded-full bg-white/10 backdrop-blur border border-white/20 hover:bg-white/25 text-white flex items-center justify-center transition-colors">
+                <ChevronRight size={16} />
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+};
+
 const Feature = ({ icon: Icon, title, desc }) => (
   <div className="flex items-start gap-3">
-    <div className="w-9 h-9 rounded-lg bg-white border border-slate-200 flex items-center justify-center text-indigo-600 shrink-0">
+    <div className="w-9 h-9 rounded-lg bg-white/10 backdrop-blur border border-white/15 flex items-center justify-center text-indigo-300 shrink-0">
       <Icon size={17} />
     </div>
     <div>
-      <p className="text-sm font-semibold text-slate-900">{title}</p>
-      <p className="text-xs text-slate-500">{desc}</p>
+      <p className="text-sm font-semibold text-white">{title}</p>
+      <p className="text-xs text-slate-400">{desc}</p>
     </div>
   </div>
 );

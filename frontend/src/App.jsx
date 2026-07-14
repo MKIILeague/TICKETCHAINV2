@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { BrowserRouter, Routes, Route, Outlet, NavLink, Navigate } from "react-router-dom";
+import { BrowserRouter, Routes, Route, Outlet, NavLink, Link, Navigate } from "react-router-dom";
 import { Ticket as TicketIcon, Wallet, LogIn, LogOut, Building2, Menu, X, User, Repeat } from "lucide-react";
 import { useTicketWallet } from "./useTicketWallet";
 import { useProfile } from "./useProfile";
@@ -40,6 +40,8 @@ function Navbar() {
 
   return (
     <header className="sticky top-0 z-50 bg-white/85 backdrop-blur-md border-b border-slate-200">
+      {/* Brand accent line — mirrored on the footer */}
+      <div className="h-0.5 bg-gradient-to-r from-indigo-600 via-violet-500 to-cyan-400" />
       <nav className="max-w-7xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between gap-4">
         
         {/* Left side: Logo & Mobile Menu Toggle */}
@@ -51,11 +53,15 @@ function Navbar() {
             {isOpen ? <X size={24} /> : <Menu size={24} />}
           </button>
           
-          <NavLink to="/" onClick={() => setIsOpen(false)} className="flex items-center gap-2.5 shrink-0">
-            <div className="w-9 h-9 bg-indigo-600 rounded-xl flex items-center justify-center">
-              <TicketIcon className="text-white w-5 h-5" />
+          <NavLink to="/" onClick={() => setIsOpen(false)} className="group flex items-center gap-2.5 shrink-0">
+            <div className="w-9 h-9 bg-gradient-to-br from-indigo-600 to-violet-600 rounded-xl flex items-center justify-center shadow-md shadow-indigo-200 group-hover:shadow-indigo-300 transition-shadow">
+              <TicketIcon className="text-white w-5 h-5 -rotate-12" />
             </div>
-            <span className="font-bold text-slate-900 tracking-tight text-base">TicketChain</span>
+            <span className="font-bold tracking-tight text-base leading-none">
+              <span className="text-slate-900">Ticket</span>
+              <span className="bg-gradient-to-r from-indigo-600 to-violet-600 bg-clip-text text-transparent">Chain</span>
+              <span className="hidden lg:block text-[10px] font-medium text-slate-400 tracking-wide mt-0.5">Own what you attend</span>
+            </span>
           </NavLink>
         </div>
 
@@ -93,7 +99,7 @@ function Navbar() {
               </button>
             </>
           ) : (
-            <button onClick={login} className="inline-flex items-center gap-1.5 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-sm font-semibold transition-colors">
+            <button onClick={login} className="inline-flex items-center gap-1.5 px-4 py-2 bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-700 hover:to-violet-700 text-white rounded-lg text-sm font-semibold shadow-sm shadow-indigo-200 transition-all">
               <LogIn size={14} /> Sign in
             </button>
           )}
@@ -129,18 +135,78 @@ function Navbar() {
   );
 }
 
+const FooterLink = ({ to, children }) => (
+  <li>
+    <Link to={to} className="text-sm text-slate-500 hover:text-indigo-600 transition-colors">{children}</Link>
+  </li>
+);
+
+const FooterChip = ({ children }) => (
+  <span className="inline-flex items-center rounded-full bg-slate-50 border border-slate-200 px-2.5 py-1 text-[11px] font-medium text-slate-500">
+    {children}
+  </span>
+);
+
 function Footer() {
   return (
-    <footer className="mt-auto border-t border-slate-200 bg-white py-10">
-      <div className="max-w-7xl mx-auto px-6 flex flex-col sm:flex-row items-center justify-between gap-3 text-slate-500 text-sm">
-        <div className="flex items-center gap-2 font-semibold text-slate-700">
-          <div className="w-6 h-6 bg-indigo-600 rounded-md flex items-center justify-center">
-            <TicketIcon size={13} className="text-white" />
+    <footer className="mt-auto bg-white border-t border-slate-200">
+      <div className="max-w-7xl mx-auto px-6 py-12 grid grid-cols-1 md:grid-cols-12 gap-10">
+
+        {/* Brand */}
+        <div className="md:col-span-6 max-w-sm">
+          <Link to="/" className="inline-flex items-center gap-2.5">
+            <div className="w-8 h-8 bg-gradient-to-br from-indigo-600 to-violet-600 rounded-lg flex items-center justify-center">
+              <TicketIcon size={16} className="text-white -rotate-12" />
+            </div>
+            <span className="font-bold tracking-tight text-base">
+              <span className="text-slate-900">Ticket</span>
+              <span className="bg-gradient-to-r from-indigo-600 to-violet-600 bg-clip-text text-transparent">Chain</span>
+            </span>
+          </Link>
+          <p className="mt-4 text-sm text-slate-500 leading-relaxed">
+            Every ticket is a unique token on Ethereum — impossible to counterfeit,
+            capped at fair resale prices, and yours from the moment you buy it.
+          </p>
+          <div className="mt-5 flex flex-wrap gap-2">
+            <FooterChip>Ethereum · Sepolia</FooterChip>
+            <FooterChip>ERC-721 tickets</FooterChip>
+            <FooterChip>110% resale cap</FooterChip>
           </div>
-          TicketChain
         </div>
-        <p>Tickets you actually own — verifiable on-chain.</p>
+
+        {/* Explore */}
+        <div className="md:col-span-3">
+          <h4 className="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-4">Explore</h4>
+          <ul className="space-y-2.5">
+            <FooterLink to="/">Events</FooterLink>
+            <FooterLink to="/resale">Resale market</FooterLink>
+            <FooterLink to="/wallet">Your tickets</FooterLink>
+            <FooterLink to="/profile">Your profile</FooterLink>
+          </ul>
+        </div>
+
+        {/* Organizers */}
+        <div className="md:col-span-3">
+          <h4 className="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-4">Hosting an event?</h4>
+          <ul className="space-y-2.5">
+            <FooterLink to="/organizer">Organizer portal</FooterLink>
+            <FooterLink to="/admin/login">Admin sign in</FooterLink>
+          </ul>
+          <p className="mt-4 text-xs text-slate-400 leading-relaxed">
+            Issue tickets your fans can trust — sell out without the scalpers.
+          </p>
+        </div>
       </div>
+
+      {/* Bottom bar */}
+      <div className="border-t border-slate-100">
+        <div className="max-w-7xl mx-auto px-6 py-5 flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-slate-400">
+          <p>© {new Date().getFullYear()} TicketChain. Built on Ethereum.</p>
+          <p>Every ticket, verifiable on-chain.</p>
+        </div>
+      </div>
+      {/* Brand accent line — mirrored from the navbar */}
+      <div className="h-0.5 bg-gradient-to-r from-indigo-600 via-violet-500 to-cyan-400" />
     </footer>
   );
 }
