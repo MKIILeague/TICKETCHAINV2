@@ -136,24 +136,15 @@ function Navbar() {
 }
 
 const FooterLink = ({ to, children }) => (
-  <li>
-    <Link to={to} className="text-sm text-slate-500 hover:text-indigo-600 transition-colors">{children}</Link>
-  </li>
-);
-
-const FooterChip = ({ children }) => (
-  <span className="inline-flex items-center rounded-full bg-slate-50 border border-slate-200 px-2.5 py-1 text-[11px] font-medium text-slate-500">
-    {children}
-  </span>
+  <Link to={to} className="text-sm text-slate-500 hover:text-indigo-600 transition-colors">{children}</Link>
 );
 
 function Footer() {
   return (
     <footer className="mt-auto bg-white border-t border-slate-200">
-      <div className="max-w-7xl mx-auto px-6 py-12 grid grid-cols-1 md:grid-cols-12 gap-10">
-
-        {/* Brand */}
-        <div className="md:col-span-6 max-w-sm">
+      <div className="max-w-7xl mx-auto px-6 py-8">
+        {/* Brand + inline nav on one line */}
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-5">
           <Link to="/" className="inline-flex items-center gap-2.5">
             <div className="w-8 h-8 bg-gradient-to-br from-indigo-600 to-violet-600 rounded-lg flex items-center justify-center">
               <TicketIcon size={16} className="text-white -rotate-12" />
@@ -162,45 +153,19 @@ function Footer() {
               <span className="text-slate-900">Ticket</span>
               <span className="bg-gradient-to-r from-indigo-600 to-violet-600 bg-clip-text text-transparent">Chain</span>
             </span>
+            <span className="ml-1 inline-flex items-center rounded-full bg-slate-50 border border-slate-200 px-2.5 py-1 text-[11px] font-medium text-slate-500">
+              Ethereum · Sepolia
+            </span>
           </Link>
-          <p className="mt-4 text-sm text-slate-500 leading-relaxed">
-            Every ticket is a unique token on Ethereum — impossible to counterfeit,
-            capped at fair resale prices, and yours from the moment you buy it.
-          </p>
-          <div className="mt-5 flex flex-wrap gap-2">
-            <FooterChip>Ethereum · Sepolia</FooterChip>
-            <FooterChip>ERC-721 tickets</FooterChip>
-            <FooterChip>110% resale cap</FooterChip>
-          </div>
-        </div>
-
-        {/* Explore */}
-        <div className="md:col-span-3">
-          <h4 className="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-4">Explore</h4>
-          <ul className="space-y-2.5">
+          <nav className="flex flex-wrap items-center gap-x-6 gap-y-2">
             <FooterLink to="/">Events</FooterLink>
             <FooterLink to="/resale">Resale market</FooterLink>
             <FooterLink to="/wallet">Your tickets</FooterLink>
-            <FooterLink to="/profile">Your profile</FooterLink>
-          </ul>
-        </div>
-
-        {/* Organizers */}
-        <div className="md:col-span-3">
-          <h4 className="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-4">Hosting an event?</h4>
-          <ul className="space-y-2.5">
             <FooterLink to="/organizer">Organizer portal</FooterLink>
-            <FooterLink to="/admin/login">Admin sign in</FooterLink>
-          </ul>
-          <p className="mt-4 text-xs text-slate-400 leading-relaxed">
-            Issue tickets your fans can trust — sell out without the scalpers.
-          </p>
+          </nav>
         </div>
-      </div>
 
-      {/* Bottom bar */}
-      <div className="border-t border-slate-100">
-        <div className="max-w-7xl mx-auto px-6 py-5 flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-slate-400">
+        <div className="mt-6 pt-5 border-t border-slate-100 flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-slate-400">
           <p>© {new Date().getFullYear()} TicketChain. Built on Ethereum.</p>
           <p>Every ticket, verifiable on-chain.</p>
         </div>

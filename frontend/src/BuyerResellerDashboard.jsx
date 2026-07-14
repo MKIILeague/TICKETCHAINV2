@@ -1100,9 +1100,9 @@ const HeroSlideshow = ({ walletAddress, connectWallet }) => {
       <div className="absolute inset-0 bg-gradient-to-r from-slate-950/90 via-slate-950/60 to-slate-950/25" />
       <div className="absolute inset-0 bg-gradient-to-t from-slate-950/70 via-transparent to-slate-950/30" />
 
-      <div className="relative max-w-7xl mx-auto px-6 sm:px-10 py-16 sm:py-24">
+      <div className="relative max-w-7xl mx-auto px-6 sm:px-10 py-10 sm:py-14">
         <div className="max-w-2xl">
-          <span className="inline-flex items-center gap-2 rounded-full bg-white/10 backdrop-blur border border-white/20 px-3 py-1.5 text-xs font-medium text-slate-100 mb-6">
+          <span className="inline-flex items-center gap-2 rounded-full bg-white/10 backdrop-blur border border-white/20 px-3 py-1.5 text-xs font-medium text-slate-100 mb-5">
             <ShieldCheck size={14} className="text-indigo-300" /> Powered by Ethereum
           </span>
 
@@ -1111,31 +1111,31 @@ const HeroSlideshow = ({ walletAddress, connectWallet }) => {
             <motion.div key={index}
               initial={{ opacity: 0, y: 14 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }}
               transition={{ duration: 0.35 }}
-              className="min-h-[180px] sm:min-h-[190px]">
-              <h1 className="text-4xl sm:text-5xl font-bold tracking-tight text-white leading-[1.1]">{slide.title}</h1>
-              <p className="mt-5 text-lg text-slate-300 leading-relaxed">{slide.sub}</p>
+              className="min-h-[130px] sm:min-h-[140px]">
+              <h1 className="text-3xl sm:text-4xl font-bold tracking-tight text-white leading-[1.1]">{slide.title}</h1>
+              <p className="mt-4 text-base text-slate-300 leading-relaxed">{slide.sub}</p>
             </motion.div>
           </AnimatePresence>
 
-          <div className="mt-6 flex flex-wrap items-center gap-3">
-            <a href="#events" className="inline-flex items-center gap-2 px-6 py-3 bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-500 hover:to-violet-500 text-white rounded-xl font-semibold shadow-lg shadow-indigo-950/40 transition-all">
-              Browse events <ArrowRight size={17} />
+          <div className="mt-5 flex flex-wrap items-center gap-3">
+            <a href="#events" className="inline-flex items-center gap-2 px-5 py-2.5 bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-500 hover:to-violet-500 text-white rounded-xl text-sm font-semibold shadow-lg shadow-indigo-950/40 transition-all">
+              Browse events <ArrowRight size={16} />
             </a>
             {!walletAddress && (
-              <button onClick={connectWallet} className="inline-flex items-center gap-2 px-6 py-3 bg-white/10 backdrop-blur border border-white/25 hover:bg-white/20 text-white rounded-xl font-semibold transition-colors">
+              <button onClick={connectWallet} className="inline-flex items-center gap-2 px-5 py-2.5 bg-white/10 backdrop-blur border border-white/25 hover:bg-white/20 text-white rounded-xl text-sm font-semibold transition-colors">
                 Connect wallet
               </button>
             )}
           </div>
 
-          <div className="mt-12 flex flex-wrap gap-x-8 gap-y-4">
+          <div className="mt-8 flex flex-wrap gap-x-8 gap-y-4">
             <Feature icon={ShieldCheck} title="Impossible to fake" desc="Every ticket is a one-of-a-kind token" />
             <Feature icon={Tag} title="Fair resale, always" desc="Prices capped at 110% of face value" />
             <Feature icon={Zap} title="Instant transfers" desc="Send a ticket to a friend in seconds" />
           </div>
 
           {/* Slide controls */}
-          <div className="mt-10 flex items-center gap-2.5">
+          <div className="mt-7 flex items-center gap-2.5">
             {HERO_SLIDES.map((_, i) => (
               <button key={i} onClick={() => go(i)} aria-label={`Go to slide ${i + 1}`}
                 className={`h-1.5 rounded-full transition-all duration-300 ${i === index ? "w-8 bg-white" : "w-4 bg-white/35 hover:bg-white/60"}`} />
