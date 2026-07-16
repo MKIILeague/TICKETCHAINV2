@@ -1,6 +1,7 @@
 import React, { useState } from "react";
 import { BrowserRouter, Routes, Route, Outlet, NavLink, Link, Navigate } from "react-router-dom";
-import { Ticket as TicketIcon, Wallet, LogIn, LogOut, Building2, Menu, X, User, Repeat } from "lucide-react";
+import { Wallet, LogIn, LogOut, Building2, Menu, X, User, Repeat } from "lucide-react";
+import BrandMark from "./BrandMark";
 import { useTicketWallet } from "./useTicketWallet";
 import { useProfile } from "./useProfile";
 import RequireRole from "./RequireRole";
@@ -55,7 +56,7 @@ function Navbar() {
           
           <NavLink to="/" onClick={() => setIsOpen(false)} className="group flex items-center gap-2.5 shrink-0">
             <div className="w-9 h-9 bg-gradient-to-br from-indigo-600 to-violet-600 rounded-xl flex items-center justify-center shadow-md shadow-indigo-200 group-hover:shadow-indigo-300 transition-shadow">
-              <TicketIcon className="text-white w-5 h-5 -rotate-12" />
+              <BrandMark className="text-white w-6 h-6" />
             </div>
             <span className="font-bold tracking-tight text-base leading-none">
               <span className="text-slate-900">Ticket</span>
@@ -147,7 +148,7 @@ function Footer() {
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-5">
           <Link to="/" className="inline-flex items-center gap-2.5">
             <div className="w-8 h-8 bg-gradient-to-br from-indigo-600 to-violet-600 rounded-lg flex items-center justify-center">
-              <TicketIcon size={16} className="text-white -rotate-12" />
+              <BrandMark className="text-white w-5 h-5" />
             </div>
             <span className="font-bold tracking-tight text-base">
               <span className="text-slate-900">Ticket</span>
