@@ -6,9 +6,8 @@ import {
   MapPin, Clock, Ticket, Tag, RefreshCw, Repeat, ShieldCheck,
   AlertCircle, Search, Hash, User
 } from "lucide-react";
-import { collection, getDocs } from "firebase/firestore";
-import { db } from "./firebase";
 import { CONTRACT_ABI, PUBLIC_RPC_URL, getContractAddress } from "./constants";
+import { fetchPublicEventStatusMap, normalizeEventName } from "./eventStatus";
 import { formatEventWindow } from "./EventsHappening";
 import { ipfsToHttp } from "./ipfs";
 import { fetchProfile } from "./profileStore";
@@ -112,30 +111,17 @@ export default function ResaleMarketplace({ walletAddress, wallet, connectWallet
   const [error, setError] = useState("");
   const [q, setQ] = useState("");
 
-  // Pull event metadata (poster/venue/time) from Firestore, keyed by the on-chain
-  // event name. EventCheckout matches the same way: details.eventName === headline.
-  const loadEventMeta = useCallback(async () => {
-    const map = new Map();
-    try {
-      const snap = await getDocs(collection(db, "events"));
-      snap.forEach((d) => {
-        const ev = d.data();
-        const key = (ev.headline || "").trim();
-        if (key && !map.has(key)) map.set(key, ev);
-      });
-    } catch (e) {
-      console.warn("[resale] event meta load failed:", e?.message);
-    }
-    return map;
-  }, []);
-
   const load = useCallback(async () => {
     setLoading(true);
     setError("");
     try {
-      const [{ provider, chainId }, metaMap] = await Promise.all([
+      // Pull event metadata (poster/venue/time) keyed by normalized on-chain
+      // event name — same lookup BuyerResellerDashboard uses, so a resale card
+      // always shows the actually-published event's venue/time, not whichever
+      // same-named draft/duplicate doc happened to load first.
+      const [{ provider, chainId }, eventStatusMap] = await Promise.all([
         getReadContext(wallet),
-        loadEventMeta(),
+        fetchPublicEventStatusMap(),
       ]);
       const contractAddress = getContractAddress(chainId);
       const contract = new ethers.Contract(contractAddress, CONTRACT_ABI, provider);
@@ -206,7 +192,7 @@ export default function ResaleMarketplace({ walletAddress, wallet, connectWallet
 
       const rows = candidates.map(({ id, details, owner }) => {
         const eventTitle = (details.eventName || `Ticket #${id}`).trim();
-        const meta = metaMap.get(eventTitle) || null;
+        const meta = eventStatusMap[normalizeEventName(eventTitle)]?.ev || null;
         return {
           id: id.toString(),
           eventTitle,
@@ -242,7 +228,7 @@ export default function ResaleMarketplace({ walletAddress, wallet, connectWallet
     } finally {
       setLoading(false);
     }
-  }, [wallet, loadEventMeta]);
+  }, [wallet]);
 
   useEffect(() => { load(); }, [load]);
 
