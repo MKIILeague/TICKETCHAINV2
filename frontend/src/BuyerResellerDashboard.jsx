@@ -5,7 +5,8 @@ import {
   Wallet, Send, Tag, Search, Compass, MapPin,
   Clock, RefreshCw, Copy, Check, ExternalLink, QrCode, Info,
   Ticket, ShieldCheck, ArrowRight, Zap, X, Ban, CheckCircle2,
-  CalendarClock, AlertTriangle, History, ChevronLeft, ChevronRight
+  CalendarClock, AlertTriangle, History, ChevronLeft, ChevronRight,
+  Maximize2, Hash, Wifi
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { CONTRACT_ABI, PUBLIC_RPC_URL, getContractAddress, getDeployments } from "./constants";
@@ -36,6 +37,21 @@ async function mapLimit(items, limit, fn) {
   return results;
 }
 
+// The secure entry packet encoded into every ticket QR: token id + owner + the
+// on-chain validation anchor (contract address + chain). The gate scanner reads
+// live chain state for this token, so an offline screenshot can't be replayed.
+// Shared by the card preview and the full-screen ticket popup so the two can
+// never encode different payloads for the same ticket.
+function buildQrPayload(ticket, owner, contractAddress, chainId) {
+  return JSON.stringify({
+    tokenId: ticket.id,
+    owner,
+    contract: contractAddress,
+    chainId,
+    v: 1,
+  });
+}
+
 // Retry a flaky read a few times with backoff (public RPCs occasionally 429).
 async function withRetry(fn, tries = 3) {
   let lastErr;
@@ -62,6 +78,14 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
   // Transfer flow states
   const [transferTicket, setTransferTicket] = useState(null);
   const [recipientAddress, setRecipientAddress] = useState("");
+
+  // Full ticket popup — tapping a ticket card opens the whole ticket (big
+  // scannable entry QR + every detail) instead of squinting at the card preview.
+  const [detailTicket, setDetailTicket] = useState(null);
+  // Token id whose resale listing is currently being cancelled on-chain. Cancel
+  // is a real Sepolia transaction (15-30s), so the button it was pressed from
+  // has to show it's working — otherwise the click looks like it did nothing.
+  const [cancelingId, setCancelingId] = useState(null);
 
   // Wallet specific states
   const [ethBalance, setEthBalance] = useState("0.00");
@@ -399,8 +423,11 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
     }
   };
 
+  // Returns true only if the listing was actually cancelled on-chain, so the
+  // caller knows whether it's safe to close the popup it was pressed from.
   const onCancelResale = async (ticketId) => {
-    if (!wallet) return;
+    if (!wallet) return false;
+    setCancelingId(String(ticketId));
     try {
       let eip1193Provider = await wallet.getEthereumProvider();
       let provider = new ethers.BrowserProvider(eip1193Provider);
@@ -423,7 +450,7 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
 
       if (balanceInEth < requiredGas) {
         addNotification(`❌ Insufficient funds for gas!\n\nYou currently have ${balanceInEth.toFixed(4)} ETH, but you need at least ${requiredGas} ETH to send this transaction.`, "error");
-        return;
+        return false;
       }
 
       const signer = await provider.getSigner();
@@ -433,9 +460,13 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
       await tx.wait();
       addNotification("Listing cancelled", "success");
       fetchDashboardData();
+      return true;
     } catch (error) {
       console.error("Cancel failed:", error);
       addNotification(error.reason || error.message || "Transaction failed", "error");
+      return false;
+    } finally {
+      setCancelingId(null);
     }
   };
 
@@ -788,6 +819,8 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
                   owner={walletAddress}
                   contractAddress={ticket.contractAddress || getContractAddress(activeChainId)}
                   chainId={activeChainId}
+                  canceling={cancelingId === ticket.id}
+                  onOpen={() => setDetailTicket(ticket)}
                   onResell={() => { setResaleTicket(ticket); setResalePriceInput(""); }}
                   onTransfer={() => { setTransferTicket(ticket); setRecipientAddress(""); }}
                   onCancel={() => onCancelResale(ticket.id)}
@@ -807,10 +840,35 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
         </>
       )}
 
-      {/* MODALS */}
+      {/* MODALS
+          Every child needs its own `key` — AnimatePresence tracks presence by
+          key, and unkeyed children all collapse to the same empty key, which
+          leaves an overlay stuck on screen when one closes as another opens. */}
       <AnimatePresence>
+        {detailTicket && (
+          <TicketDetailModal
+            key="ticket-detail"
+            ticket={detailTicket}
+            meta={eventStatusMap[normalizeEventName(detailTicket.eventTitle)]?.ev}
+            status={statusFor(detailTicket.eventTitle)}
+            owner={walletAddress}
+            contractAddress={detailTicket.contractAddress || getContractAddress(activeChainId)}
+            chainId={activeChainId}
+            networkLabel={networkLabel}
+            canceling={cancelingId === detailTicket.id}
+            onClose={() => setDetailTicket(null)}
+            // Resell/transfer hand off to their own sheet, so this one closes to
+            // avoid stacking. Cancel has no follow-up sheet: it stays open and
+            // shows progress until the transaction confirms, otherwise the click
+            // would just blank the screen for the 15-30s the tx takes.
+            onResell={() => { setResaleTicket(detailTicket); setResalePriceInput(""); setDetailTicket(null); }}
+            onTransfer={() => { setTransferTicket(detailTicket); setRecipientAddress(""); setDetailTicket(null); }}
+            onCancel={() => onCancelResale(detailTicket.id).then((ok) => ok && setDetailTicket(null))}
+          />
+        )}
+
         {resaleTicket && (
-          <Modal onClose={() => setResaleTicket(null)} icon={<Tag size={20} />} title="List for resale" subtitle="Anti-scalping cap applies">
+          <Modal key="resale" onClose={() => setResaleTicket(null)} icon={<Tag size={20} />} title="List for resale" subtitle="Anti-scalping cap applies">
             <p className="text-sm text-slate-600 leading-relaxed">
               To keep things fair, the price is capped at 110% of the original.
               Maximum: <span className="font-semibold text-slate-900">{rm(resaleMaxPrice)}</span> <span className="text-slate-400">({ethLabel(resaleMaxPrice)})</span>.
@@ -852,7 +910,7 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
         )}
 
         {transferTicket && (
-          <Modal onClose={() => setTransferTicket(null)} icon={<Send size={20} />} title="Transfer ticket" subtitle="Send directly to another wallet">
+          <Modal key="transfer" onClose={() => setTransferTicket(null)} icon={<Send size={20} />} title="Transfer ticket" subtitle="Send directly to another wallet">
             <p className="text-sm text-slate-600 leading-relaxed">
               This sends the ticket to the address below. Transfers are final and can't be undone.
             </p>
@@ -885,7 +943,7 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
         )}
 
         {showSendModal && (
-          <Modal onClose={() => setShowSendModal(false)} icon={<Send size={20} />} title="Send ETH" subtitle={networkLabel}>
+          <Modal key="send-eth" onClose={() => setShowSendModal(false)} icon={<Send size={20} />} title="Send ETH" subtitle={networkLabel}>
             <div>
               <label className="block text-sm font-medium text-slate-700 mb-1.5">Recipient address</label>
               <input
@@ -932,7 +990,7 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
         )}
 
         {showReceiveModal && (
-          <Modal onClose={() => setShowReceiveModal(false)} icon={<QrCode size={20} />} title="Receive ETH" subtitle="Scan or copy your address">
+          <Modal key="receive-eth" onClose={() => setShowReceiveModal(false)} icon={<QrCode size={20} />} title="Receive ETH" subtitle="Scan or copy your address">
             <div className="flex flex-col items-center">
               <div className="p-5 bg-white rounded-2xl border border-slate-200 flex items-center justify-center relative">
                 <svg width="168" height="168" viewBox="0 0 29 29" fill="none" className="text-slate-900">
@@ -1205,7 +1263,7 @@ const TicketCardSkeleton = () => (
 );
 
 // Premium dark "glassmorphism" ticket card with a secure entry QR packet.
-const TicketCard = ({ ticket, meta, status, owner, contractAddress, chainId, onResell, onTransfer, onCancel }) => {
+const TicketCard = ({ ticket, meta, status, owner, contractAddress, chainId, canceling, onOpen, onResell, onTransfer, onCancel }) => {
   const canceled = status === EVENT_STATUS.CANCELED;
   const finished = status === EVENT_STATUS.FINISHED;
   const used = !!ticket.isUsed;
@@ -1214,16 +1272,7 @@ const TicketCard = ({ ticket, meta, status, owner, contractAddress, chainId, onR
   const venue = meta?.venue || ticket.venue;
   const timeLabel = meta?.timestamp ? formatEventWindow(meta.timestamp) : ticket.date;
 
-  // Secure entry packet encoded into the QR: token id + owner + the on-chain
-  // validation anchor (contract address + chain). The gate scanner reads live
-  // chain state for this token, so an offline screenshot can't be replayed.
-  const qrPayload = JSON.stringify({
-    tokenId: ticket.id,
-    owner,
-    contract: contractAddress,
-    chainId,
-    v: 1,
-  });
+  const qrPayload = buildQrPayload(ticket, owner, contractAddress, chainId);
 
   return (
     <motion.div
@@ -1235,6 +1284,15 @@ const TicketCard = ({ ticket, meta, status, owner, contractAddress, chainId, onR
       <div className="absolute -bottom-20 -left-16 w-44 h-44 bg-fuchsia-500/10 rounded-full blur-3xl pointer-events-none" />
 
       <div className="relative">
+        {/* Everything above the action row is one big press target: tapping the
+            ticket opens the full-screen ticket popup. The action buttons stay
+            outside it so Resell/Transfer don't also fire the popup. */}
+        <button
+          type="button"
+          onClick={onOpen}
+          aria-label={`Open ticket for ${ticket.eventTitle}`}
+          className="group block w-full text-left cursor-pointer rounded-xl outline-none focus-visible:ring-2 focus-visible:ring-indigo-400/70"
+        >
         {/* Header */}
         <div className="flex items-start justify-between gap-3">
           <div className="min-w-0">
@@ -1247,13 +1305,18 @@ const TicketCard = ({ ticket, meta, status, owner, contractAddress, chainId, onR
           <TicketStateBadge canceled={canceled} finished={finished} used={used} />
         </div>
 
-        {/* Secure entry QR */}
+        {/* Secure entry QR — a preview; press for the full-size scannable one */}
         <div className="mt-5 flex flex-col items-center">
-          <div className={`p-3 bg-white rounded-2xl shadow-inner ${used || canceled ? "opacity-50 grayscale" : ""}`}>
+          <div className={`relative p-3 bg-white rounded-2xl shadow-inner transition-transform group-hover:scale-[1.03] ${used || canceled ? "opacity-50 grayscale" : ""}`}>
             <QRCodeSVG value={qrPayload} size={150} level="H" marginSize={1} bgColor="#ffffff" fgColor="#0f172a" />
+            <div className="absolute inset-0 flex items-center justify-center rounded-2xl bg-slate-900/70 opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100">
+              <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-white">
+                <Maximize2 size={13} /> Open ticket
+              </span>
+            </div>
           </div>
-          <p className="mt-3 text-[11px] leading-relaxed text-slate-500 text-center max-w-[16rem]">
-            Active connection required for gate validation. Screenshots or offline tokens will be rejected by scanners.
+          <p className="mt-3 inline-flex items-center gap-1.5 text-[11px] font-semibold text-indigo-300">
+            <Maximize2 size={11} /> Tap ticket to enlarge QR
           </p>
         </div>
 
@@ -1270,6 +1333,7 @@ const TicketCard = ({ ticket, meta, status, owner, contractAddress, chainId, onR
             <span className="font-mono text-indigo-300">#{ticket.id}</span>
           </div>
         </div>
+        </button>
 
         {/* Actions / state */}
         <div className="mt-4 pt-4 border-t border-white/10">
@@ -1283,8 +1347,14 @@ const TicketCard = ({ ticket, meta, status, owner, contractAddress, chainId, onR
             <div className="w-full py-3 bg-white/5 border border-white/10 text-slate-400 rounded-xl text-center font-semibold text-sm">Trading frozen</div>
           ) : ticket.isListed ? (
             <div className="space-y-2.5">
-              <button onClick={onCancel} className="w-full py-3 bg-white/5 border border-white/10 hover:bg-white/10 text-slate-200 rounded-xl font-semibold text-sm flex items-center justify-center gap-2 transition-colors">
-                <RefreshCw size={14} /> Cancel listing
+              <button
+                onClick={onCancel}
+                disabled={canceling}
+                className="w-full py-3 bg-white/5 border border-white/10 hover:bg-white/10 disabled:opacity-60 disabled:cursor-not-allowed text-slate-200 rounded-xl font-semibold text-sm flex items-center justify-center gap-2 transition-colors"
+              >
+                {canceling
+                  ? <><span className="h-4 w-4 animate-spin rounded-full border-2 border-slate-300 border-t-transparent" /> Cancelling…</>
+                  : <><RefreshCw size={14} /> Cancel listing</>}
               </button>
               {!ticket.isPrimary && (
                 <Link to="/resale" className="flex items-center justify-center gap-1.5 text-xs font-medium text-indigo-300 hover:text-indigo-200 transition-colors">
@@ -1304,8 +1374,221 @@ const TicketCard = ({ ticket, meta, status, owner, contractAddress, chainId, onR
   );
 };
 
+// One row of the ticket popup's detail table.
+const DetailRow = ({ icon: Icon, label, children, mono }) => (
+  <div className="flex items-start justify-between gap-4 py-2.5">
+    <span className="inline-flex items-center gap-2 shrink-0 text-xs text-slate-400">
+      {Icon && <Icon size={13} className="text-indigo-400" />} {label}
+    </span>
+    <span className={`text-right text-xs font-semibold text-white break-all ${mono ? "font-mono" : ""}`}>
+      {children}
+    </span>
+  </div>
+);
+
+// The full ticket, opened by pressing a ticket card. The point of the popup is
+// the entry QR at a size a gate scanner can actually read across a phone screen
+// at arm's length, with every detail of the ticket underneath it.
+const TicketDetailModal = ({
+  ticket, meta, status, owner, contractAddress, chainId, networkLabel, canceling,
+  onClose, onResell, onTransfer, onCancel,
+}) => {
+  const canceled = status === EVENT_STATUS.CANCELED;
+  const finished = status === EVENT_STATUS.FINISHED;
+  const used = !!ticket.isUsed;
+  const frozen = isTransferFrozen(status);
+  const dimmed = used || canceled;
+
+  const venue = meta?.venue || ticket.venue;
+  const timeLabel = meta?.timestamp ? formatEventWindow(meta.timestamp) : ticket.date;
+  const qrPayload = buildQrPayload(ticket, owner, contractAddress, chainId);
+  const explorerUrl = chainId === 11155111
+    ? `https://sepolia.etherscan.io/token/${contractAddress}?a=${ticket.id}`
+    : null;
+
+  // Escape closes — this popup is the one people open on a phone at the gate,
+  // so every obvious dismissal gesture should work. The one exception is while a
+  // cancellation is in flight: dismissing then would hide the progress and leave
+  // the user staring at nothing while the transaction is still running.
+  const requestClose = () => { if (!canceling) onClose(); };
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === "Escape" && !canceling) onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose, canceling]);
+
+  return (
+    <motion.div
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      transition={{ duration: 0.18 }}
+      className="fixed inset-0 bg-slate-950/70 backdrop-blur-sm flex items-center justify-center p-4 z-[1000] overflow-y-auto"
+      onClick={requestClose}
+    >
+      <motion.div
+        initial={{ scale: 0.96, opacity: 0, y: 16 }}
+        animate={{ scale: 1, opacity: 1, y: 0 }}
+        exit={{ scale: 0.96, opacity: 0, y: 16 }}
+        transition={{ duration: 0.18 }}
+        onClick={(e) => e.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+        aria-label={`Ticket for ${ticket.eventTitle}`}
+        className="relative my-auto w-full max-w-md max-h-[92vh] overflow-y-auto rounded-3xl border border-white/10 bg-slate-900 shadow-[0_20px_70px_-15px_rgba(79,70,229,0.6)]"
+      >
+        {/* neon accent glow */}
+        <div className="absolute -top-24 -right-20 w-56 h-56 bg-indigo-500/25 rounded-full blur-3xl pointer-events-none" />
+        <div className="absolute -bottom-24 -left-20 w-56 h-56 bg-fuchsia-500/10 rounded-full blur-3xl pointer-events-none" />
+
+        <div className="relative">
+          {/* Header */}
+          <div className="flex items-start gap-3 p-6 pb-4">
+            <div className="min-w-0 flex-1">
+              <p className="text-[11px] font-semibold uppercase tracking-widest text-indigo-400">Entry ticket</p>
+              <h3 className="mt-1 text-xl font-bold leading-snug text-white">{ticket.eventTitle}</h3>
+              <div className="mt-2.5 space-y-1 text-xs text-slate-400">
+                <p className="flex items-center gap-1.5"><MapPin size={12} className="shrink-0 text-indigo-400" /> {venue}</p>
+                <p className="flex items-center gap-1.5"><Clock size={12} className="shrink-0 text-indigo-400" /> {timeLabel}</p>
+              </div>
+            </div>
+            <button
+              onClick={requestClose}
+              aria-label="Close ticket"
+              className="shrink-0 rounded-lg p-1.5 text-slate-400 transition-colors hover:bg-white/10 hover:text-white"
+            >
+              <X size={20} />
+            </button>
+          </div>
+
+          <div className="px-6">
+            <TicketStateBadge canceled={canceled} finished={finished} used={used} />
+          </div>
+
+          {/* The scannable QR — the reason this popup exists */}
+          <div className="mt-4 flex flex-col items-center px-6">
+            <div className={`rounded-3xl bg-white p-5 shadow-xl ${dimmed ? "opacity-40 grayscale" : ""}`}>
+              <QRCodeSVG value={qrPayload} size={232} level="H" marginSize={1} bgColor="#ffffff" fgColor="#0f172a" />
+            </div>
+            {dimmed && (
+              <p className="mt-3 text-xs font-semibold text-slate-400">
+                {used ? "Already redeemed at the gate — this QR will not scan." : "Event canceled — this QR will not scan."}
+              </p>
+            )}
+          </div>
+
+          {/* Perforated stub divider */}
+          <div className="relative my-6 flex items-center">
+            <div className="absolute -left-3 h-6 w-6 rounded-full bg-slate-950" />
+            <div className="h-px flex-1 border-t border-dashed border-white/20" />
+            <div className="absolute -right-3 h-6 w-6 rounded-full bg-slate-950" />
+          </div>
+
+          {/* Everything about this ticket */}
+          <div className="px-6">
+            <div className="divide-y divide-white/5 rounded-2xl border border-white/10 bg-white/5 px-4">
+              <DetailRow icon={Hash} label="Token ID" mono>#{ticket.id}</DetailRow>
+              <DetailRow icon={Tag} label={ticket.isListed ? "Listed for" : "Face value"}>
+                {rm(ticket.isListed ? ticket.resalePrice : ticket.mintPrice)}
+                <span className="ml-1 font-normal text-slate-400">
+                  ({ethLabel(ticket.isListed ? ticket.resalePrice : ticket.mintPrice, 3)})
+                </span>
+              </DetailRow>
+              {ticket.isListed && (
+                <DetailRow icon={Tag} label="Original price">
+                  {rm(ticket.mintPrice)}
+                  <span className="ml-1 font-normal text-slate-400">({ethLabel(ticket.mintPrice, 3)})</span>
+                </DetailRow>
+              )}
+              <DetailRow icon={Wallet} label="Owner" mono>{owner}</DetailRow>
+              <DetailRow icon={ShieldCheck} label="Contract" mono>
+                {explorerUrl ? (
+                  <a
+                    href={explorerUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1 text-indigo-300 transition-colors hover:text-indigo-200"
+                  >
+                    {contractAddress} <ExternalLink size={11} className="shrink-0" />
+                  </a>
+                ) : contractAddress}
+              </DetailRow>
+              <DetailRow icon={Zap} label="Network">{networkLabel}</DetailRow>
+            </div>
+
+            <p className="mt-4 flex items-start gap-2 text-[11px] leading-relaxed text-slate-500">
+              <Wifi size={13} className="mt-px shrink-0 text-slate-500" />
+              Verified live against the blockchain at the gate. An active connection is required — screenshots and
+              offline copies of this QR will be rejected by scanners.
+            </p>
+          </div>
+
+          {/* Same actions as the card, so the popup is never a dead end */}
+          <div className="mt-5 border-t border-white/10 p-6">
+            {used ? (
+              <div className="w-full rounded-xl border border-white/10 bg-white/5 py-3 text-center text-sm font-semibold text-slate-400">
+                Redeemed at gate
+              </div>
+            ) : canceled ? (
+              <div className="flex w-full items-center justify-center gap-2 rounded-xl border border-red-500/30 bg-red-500/10 py-3 text-center text-sm font-semibold text-red-300">
+                <Ban size={14} /> Event canceled — frozen
+              </div>
+            ) : frozen ? (
+              <div className="w-full rounded-xl border border-white/10 bg-white/5 py-3 text-center text-sm font-semibold text-slate-400">
+                Trading frozen
+              </div>
+            ) : ticket.isListed ? (
+              <>
+                <button
+                  onClick={onCancel}
+                  disabled={canceling}
+                  className="flex w-full items-center justify-center gap-2 rounded-xl border border-white/10 bg-white/5 py-3 text-sm font-semibold text-slate-200 transition-colors hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {canceling
+                    ? <><span className="h-4 w-4 animate-spin rounded-full border-2 border-slate-300 border-t-transparent" /> Cancelling…</>
+                    : <><RefreshCw size={14} /> Cancel listing</>}
+                </button>
+                {canceling && (
+                  <p className="mt-2.5 text-center text-xs leading-relaxed text-slate-400">
+                    Waiting for the blockchain to confirm. This usually takes 15–30 seconds — keep this open.
+                  </p>
+                )}
+              </>
+            ) : (
+              <div className="grid grid-cols-2 gap-3">
+                <button
+                  onClick={onResell}
+                  className="rounded-xl bg-indigo-600 py-3 text-sm font-semibold text-white shadow-lg shadow-indigo-500/20 transition-colors hover:bg-indigo-500"
+                >
+                  Resell
+                </button>
+                <button
+                  onClick={onTransfer}
+                  className="rounded-xl border border-white/10 bg-white/5 py-3 text-sm font-semibold text-slate-200 transition-colors hover:bg-white/10"
+                >
+                  Transfer
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      </motion.div>
+    </motion.div>
+  );
+};
+
+// The backdrop animates too. A plain <div> here stays fully opaque while the
+// panel inside fades away, so closing leaves a blurred sheet over the page with
+// nothing on it — and if the exit never resolves, it never goes away.
 const Modal = ({ children, onClose, icon, title, subtitle }) => (
-  <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-sm flex items-center justify-center p-4 z-[1000]" onClick={onClose}>
+  <motion.div
+    initial={{ opacity: 0 }}
+    animate={{ opacity: 1 }}
+    exit={{ opacity: 0 }}
+    transition={{ duration: 0.18 }}
+    className="fixed inset-0 bg-slate-900/40 backdrop-blur-sm flex items-center justify-center p-4 z-[1000]"
+    onClick={onClose}
+  >
     <motion.div
       initial={{ scale: 0.96, opacity: 0, y: 12 }}
       animate={{ scale: 1, opacity: 1, y: 0 }}
@@ -1332,7 +1615,7 @@ const Modal = ({ children, onClose, icon, title, subtitle }) => (
         {children}
       </div>
     </motion.div>
-  </div>
+  </motion.div>
 );
 
 export default BuyerResellerDashboard;
