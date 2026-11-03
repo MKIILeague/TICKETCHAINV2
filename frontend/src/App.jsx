@@ -13,6 +13,7 @@ import SystemAdminConsole from "./SystemAdminConsole";
 import AdminLogin from "./AdminLogin";
 import Profile from "./Profile";
 import ResaleMarketplace from "./ResaleMarketplace";
+import AppUpdateNotice from "./AppUpdateNotice";
 
 // ─── Consumer navbar (UX only — real authority is on-chain) ──────────────────
 function Navbar() {
@@ -233,6 +234,7 @@ function AdminConsolePage() {
 export default function App() {
   return (
     <BrowserRouter>
+      <AppUpdateNotice />
       <Routes>
         {/* Consumer routes — share the navbar + footer chrome */}
         <Route element={<ConsumerLayout />}>

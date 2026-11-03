@@ -7,7 +7,7 @@ export default defineConfig({
   plugins: [
     react(),
     VitePWA({
-      registerType: 'autoUpdate',
+      registerType: 'prompt',
       includeAssets: ['favicon.svg', 'favicon.ico', 'icons.svg'],
       manifest: {
         name: 'TicketChain — Decentralized Event Ticketing',
@@ -31,7 +31,23 @@ export default defineConfig({
         ],
       },
       workbox: {
-        globPatterns: ['**/*.{js,css,html,svg,png,ico}'],
+        // HTML must come from the current deployment on navigation. Cached
+        // app shells previously kept the old minting code alive after deploys.
+        globPatterns: ['**/*.{js,css,svg,png,ico}'],
+        navigateFallback: null,
+        skipWaiting: false,
+        clientsClaim: true,
+        cleanupOutdatedCaches: true,
+        runtimeCaching: [{
+          urlPattern: ({ request }) => request.mode === 'navigate',
+          handler: 'NetworkFirst',
+          options: {
+            cacheName: 'ticketchain-pages',
+            networkTimeoutSeconds: 5,
+            cacheableResponse: { statuses: [200] },
+            expiration: { maxEntries: 12, maxAgeSeconds: 86400 },
+          },
+        }],
         maximumFileSizeToCacheInBytes: 6 * 1024 * 1024,
       },
     }),

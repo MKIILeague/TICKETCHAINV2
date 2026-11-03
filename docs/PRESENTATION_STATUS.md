@@ -82,6 +82,27 @@ This repair is frontend-only and works with the existing deployed contract. It
 must be committed and deployed to the hosted frontend before it changes the live
 website. No public mint transactions were submitted by the agent during testing.
 
+## Older website version retained in an open tab
+
+The user later saw the old “Too many tickets for a single transaction” alert for
+50 tickets. A fresh HTTP check of `ticketchainv-2.vercel.app` retrieved the deployed
+`index-yEmHx_sy.js` bundle: it contained the new resume/batching flow and did not
+contain that alert. The tab was therefore running an older application version.
+The existing PWA registration activated updates without notifying or reloading
+an already-open page, and its cached navigation shell could retain old HTML.
+
+The frontend now uses an explicit update notice, checks for updates on focus and
+periodically, and waits for the user to finish wallet work before choosing reload.
+Page navigations use network-first HTML instead of a precached app shell, while
+hashed static assets remain cached. Vercel headers prevent caching the HTML and
+service-worker registration files. The implementation follows the
+[Vite PWA update flow](https://vite-pwa-org.netlify.app/guide/prompt-for-update.html).
+
+An already-open old tab still needs a one-time refresh or close/reopen. A private
+window can verify the current deployment without clearing the original browser's
+login or mint-recovery records. Never clear local storage to repair a stale page
+while a publication may need its saved recovery state.
+
 ## Updated contract versus existing Sepolia contracts
 
 `contracts/TicketContract.sol` now rejects accidental ETH payments, self-purchases,
