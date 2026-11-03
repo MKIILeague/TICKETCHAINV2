@@ -2,7 +2,7 @@
 
 ## Current result
 
-Local source checks pass: 30 contract/mint-integration tests, 49 frontend logic tests, 9 backend
+Local source checks pass: 30 contract/mint-integration tests, 51 frontend logic tests, 9 backend
 authentication tests, ESLint and the production/PWA build. The frontend serves at
 http://localhost:5173, and the optional backend health check responds at port 5000.
 The protected backend profile rejects requests without an access token.
@@ -11,9 +11,9 @@ Read-only live checks confirm that Pinata authentication and Privy's JWKS endpoi
 respond. The configured Sepolia deployment exists, is unpaused, has 500 minted
 tickets, and is owned by `0x6eE97e0DFdaf29f365Fa82e26B63388f5748f707`.
 
-**Firestore reads are restored after the user updated the rules.** The new live
-check retrieved 11 published events, but none have an upcoming date. Publish a
-small future-dated event before rehearsing the storefront and checkout. The initial
+**Firestore reads are restored after the user updated the rules.** The earlier live
+check retrieved 11 past events. Native Chrome inspection now shows the user's
+future-dated 50-ticket `SUBANG RUN FESTIVAL` in the storefront. The initial
 permission error came from rules that expired on 21 September 2026.
 
 **The app is not yet verified end to end for the presentation.** The agent did not

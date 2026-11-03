@@ -54,6 +54,20 @@ test('a publication started during activation also prevents reload', async () =>
   await assert.rejects(update, /publishing is in progress/);
   assert.equal(reloads, 0);
 });
+test('a publication started before timeout prevents worker recovery and reload', async () => {
+  const worker = new Worker(); let busy = false, retired = 0, reloads = 0;
+  const update = applyAppUpdate({ registration: { waiting: worker, unregister: async () => { retired++; } }, serviceWorker: container(),
+    reload: () => reloads++, isBusy: () => busy, timeoutMs: 5 });
+  busy = true;
+  await assert.rejects(update, /publishing is in progress/);
+  assert.equal(retired, 0); assert.equal(reloads, 0);
+});
+test('publication activity is checked again after unregistering a stalled worker', async () => {
+  const worker = new Worker(); let busy = false, reloads = 0;
+  await assert.rejects(applyAppUpdate({ registration: { waiting: worker, unregister: async () => { busy = true; } }, serviceWorker: container(),
+    reload: () => reloads++, isBusy: () => busy, timeoutMs: 5 }), /publishing is in progress/);
+  assert.equal(reloads, 0);
+});
 test('a replaced worker recovers instead of getting stuck in an update loop', async () => {
   const worker = new Worker(); let reloads = 0;
   const update = applyAppUpdate({ registration: { waiting: worker, unregister: async () => true }, serviceWorker: container(), reload: () => reloads++ });
