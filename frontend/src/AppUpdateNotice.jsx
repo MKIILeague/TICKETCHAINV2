@@ -1,19 +1,22 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { useRegisterSW } from 'virtual:pwa-register/react';
+import { applyAppUpdate } from './appUpdate';
+import { isPublishing, subscribePublishing } from './publicationActivity';
 
 export default function AppUpdateNotice() {
   const [registration, setRegistration] = useState(null);
   const [activatedUpdate, setActivatedUpdate] = useState(false);
   const [updating, setUpdating] = useState(false);
   const [error, setError] = useState('');
-  const reloadRequested = useRef(false);
-  const { needRefresh: [needRefresh, setNeedRefresh], updateServiceWorker } = useRegisterSW({
+  const updateInProgress = useRef(false);
+  const publishing = useSyncExternalStore(subscribePublishing, isPublishing, () => false);
+  const { needRefresh: [needRefresh, setNeedRefresh] } = useRegisterSW({
     immediate: true,
     onRegisteredSW(_url, value) { setRegistration(value || null); },
     onNeedReload() {
-      // Updating another tab must not reload this tab during a wallet request.
-      if (reloadRequested.current) window.location.reload();
-      else setActivatedUpdate(true);
+      // Activation alone never reloads a tab. The user's update action owns
+      // the activation listeners and checks publication activity before reload.
+      setActivatedUpdate(true);
     },
     onRegisterError(value) { console.warn('App update registration failed:', value); },
   });
@@ -47,25 +50,27 @@ export default function AppUpdateNotice() {
   }, [registration, setNeedRefresh]);
 
   const update = async () => {
-    setUpdating(true); setError(''); reloadRequested.current = true;
+    if (updateInProgress.current || isPublishing()) return;
+    updateInProgress.current = true;
+    setUpdating(true); setError('');
     try {
-      if (activatedUpdate) window.location.reload();
-      else await updateServiceWorker(true);
+      await applyAppUpdate({ registration, serviceWorker: navigator.serviceWorker,
+        reload: () => window.location.reload(), isBusy: isPublishing });
     } catch (value) {
-      reloadRequested.current = false;
-      setError('Could not update yet. Check your connection and try again.');
+      setError(value.message || 'Could not update yet. Check your connection and try again.');
       console.warn('App update failed:', value);
-    } finally { setUpdating(false); }
+      setUpdating(false);
+    } finally { updateInProgress.current = false; }
   };
 
   if (!needRefresh && !activatedUpdate) return null;
   return (
     <aside role="status" aria-live="polite" className="fixed bottom-4 left-4 right-4 z-50 max-w-md rounded-2xl border border-indigo-200 bg-white p-5 text-slate-900 shadow-xl sm:right-auto">
       <p className="text-sm font-semibold">A newer version of TicketChain is ready</p>
-      <p className="mt-1 text-sm text-slate-600">Finish any wallet confirmation and save your draft, then update the app.</p>
+      <p className="mt-1 text-sm text-slate-600">{publishing ? 'Ticket publishing is in progress. Finish or stop after the current batch, then update.' : 'Finish any wallet confirmation and save your draft, then update the app.'}</p>
       {error && <p role="alert" className="mt-2 text-sm text-red-600">{error}</p>}
-      <button onClick={update} disabled={updating} className="mt-3 rounded-lg bg-indigo-600 px-4 py-2 text-sm font-semibold text-white hover:bg-indigo-700 disabled:opacity-50">
-        {updating ? 'Updating...' : 'Update app'}
+      <button onClick={update} disabled={updating || publishing} className="mt-3 rounded-lg bg-indigo-600 px-4 py-2 text-sm font-semibold text-white hover:bg-indigo-700 disabled:opacity-50">
+        {publishing ? 'Finish publishing to update' : updating ? 'Updating...' : 'Update app'}
       </button>
     </aside>
   );

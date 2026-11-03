@@ -2,7 +2,7 @@
 
 ## Current result
 
-Local source checks pass: 30 contract/mint-integration tests, 34 frontend logic tests, 9 backend
+Local source checks pass: 30 contract/mint-integration tests, 45 frontend logic tests, 9 backend
 authentication tests, ESLint and the production/PWA build. The frontend serves at
 http://localhost:5173, and the optional backend health check responds at port 5000.
 The protected backend profile rejects requests without an access token.
@@ -120,6 +120,20 @@ An already-open old tab still needs a one-time refresh or close/reopen. A privat
 window can verify the current deployment without clearing the original browser's
 login or mint-recovery records. Never clear local storage to repair a stale page
 while a publication may need its saved recovery state.
+
+The first update-button implementation had a reload gap: Workbox's refresh callback
+could be missed after manually discovering a waiting worker or after another tab
+activated it. Clicking sent a message but did not necessarily reload the page.
+`appUpdate.js` now listens directly to activation/state/controller events before
+sending `SKIP_WAITING`, reloads immediately when no update is waiting, and reports
+a retryable timeout instead of silently returning. It cleans up listeners and
+reloads at most once. These paths have focused regression tests based on the
+[service-worker activation lifecycle](https://developer.mozilla.org/en-US/docs/Web/API/ServiceWorker/state).
+
+Publication activity is tracked through the complete Publish/Resume operation.
+The update button is disabled during that work, and activity is checked again
+before reloading. Worker activation in another tab never forces a reload here.
+The existing login and mint-recovery storage are not cleared by an app update.
 
 ## Updated contract versus existing Sepolia contracts
 

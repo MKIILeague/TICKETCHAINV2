@@ -19,6 +19,7 @@ import { readPendingPublish, savePendingPublish, clearPendingPublish } from "./p
 import { mintEventBatches } from "./mintBatches";
 import { createMintApprovalSender } from "./mintApproval";
 import { useSendTransaction } from "@privy-io/react-auth";
+import { beginPublication } from "./publicationActivity";
 
 const CATEGORIES = ["Concert", "Sports", "Theatre", "Conference"];
 
@@ -303,6 +304,7 @@ export default function EventWizard({ wallet, walletAddress, orgData, isPaused, 
   const recoverPublish = async () => {
     if (!pendingForWallet || busy || publishLock.current) return;
     publishLock.current = true; setError("");
+    const releasePublication = beginPublication();
     try {
       let record = pendingForWallet;
       if (record.request && (record.submitting || record.pendingHash) && recoveryHash.trim()) {
@@ -313,7 +315,7 @@ export default function EventWizard({ wallet, walletAddress, orgData, isPaused, 
       }
       await finishPublication(record);
     } catch (error) { showPublishError(error); }
-    finally { publishLock.current = false; }
+    finally { publishLock.current = false; releasePublication(); }
   };
 
   const discardPreparation = () => {
@@ -329,6 +331,7 @@ export default function EventWizard({ wallet, walletAddress, orgData, isPaused, 
     if (validation) { setError(validation); return; }
     if (!wallet || !walletAddress) { setError("Connect your wallet first."); return; }
     publishLock.current = true;
+    const releasePublication = beginPublication();
     try {
       setPhase("ipfs"); setError(""); setMintProgress(null);
       const { id, imageHash } = await persistDraft();
@@ -360,7 +363,7 @@ export default function EventWizard({ wallet, walletAddress, orgData, isPaused, 
       checkpointMint(record);
       await finishPublication(record);
     } catch (error) { showPublishError(error); }
-    finally { publishLock.current = false; }
+    finally { publishLock.current = false; releasePublication(); }
   };
 
   const handleDelete = async (ev) => {
