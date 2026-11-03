@@ -17,5 +17,10 @@ export default defineConfig([
       globals: globals.browser,
       parserOptions: { ecmaFeatures: { jsx: true } },
     },
+    rules: {
+      // Catch render-time TDZ errors while allowing callbacks to refer to
+      // declarations in their enclosing scope that run before the callback.
+      'no-use-before-define': ['error', { functions: false, classes: false, variables: false }],
+    },
   },
 ])

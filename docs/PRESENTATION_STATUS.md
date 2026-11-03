@@ -2,7 +2,7 @@
 
 ## Current result
 
-Local source checks pass: 30 contract/mint-integration tests, 51 frontend logic tests, 9 backend
+Local source checks pass: 30 contract/mint-integration tests, 52 frontend tests, 9 backend
 authentication tests, ESLint and the production/PWA build. The frontend serves at
 http://localhost:5173, and the optional backend health check responds at port 5000.
 The protected backend profile rejects requests without an access token.
@@ -26,6 +26,12 @@ resale and camera scans still require a manual rehearsal.
 
 ## Repairs
 
+- Fixed an event checkout render crash: total price used the quantity before its
+  `const` declaration, producing `Cannot access 'E' before initialization` in
+  the production bundle. Quantity is now initialized first. A real checkout
+  render test covers the initial loading state, and ESLint checks references
+  before same-scope declarations across the frontend. Online error screens no
+  longer suggest switching to localhost for unrelated failures.
 - Replaced the failing `sepolia.drpc.org` public RPC, which now returns a paid-plan
   error for Sepolia, with a tested Tenderly endpoint. Historical log queries have
   a bounded-window fallback.

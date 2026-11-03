@@ -60,10 +60,8 @@ export default function EventCheckout({ walletAddress, wallet, connectWallet }) 
   const sold = Number(ev?.sold) || 0;
   const remaining = Math.max(0, supply - sold);
   const price = Number(ev?.priceEth) || 0;
-  const totalCost = price * qty;
-
   const qty = Math.min(Math.max(1, requestedQty), Math.max(1, remaining));
-
+  const totalCost = price * qty;
   const exceedsStock = qty > remaining;
 
   // The contract address the event was actually minted on (stored at publish).

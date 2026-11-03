@@ -33,9 +33,13 @@ class PrivyErrorBoundary extends Component {
           <div style={{ maxWidth: 560, width: '100%', background: '#1e2538', border: '1px solid #ef4444', borderRadius: 16, padding: '2rem' }}>
             <h1 style={{ fontSize: 18, fontWeight: 900, textTransform: 'uppercase', letterSpacing: '-0.02em', marginTop: 0 }}>Something went wrong</h1>
             <p style={{ color: '#94a3b8', fontSize: 13, lineHeight: 1.6 }}>
-              The app hit an error while loading. If this mentions an <strong>origin</strong> or <strong>403</strong> issue,
-              make sure you are visiting <code style={{ color: '#818cf8' }}>http://localhost:5173</code> (not 127.0.0.1).
+              This page could not finish loading. Reload the page to try again.
             </p>
+            {hostname === 'localhost' && /origin|403/i.test(String(this.state.error?.message || this.state.error)) && (
+              <p style={{ color: '#94a3b8', fontSize: 13, lineHeight: 1.6 }}>
+                For local development, visit <code style={{ color: '#818cf8' }}>http://localhost:5173</code> (not 127.0.0.1).
+              </p>
+            )}
             <pre style={{ background: '#0b0f19', border: '1px solid #334155', borderRadius: 8, padding: 12, fontSize: 12, color: '#f87171', overflow: 'auto', whiteSpace: 'pre-wrap' }}>
               {String(this.state.error?.message || this.state.error)}
             </pre>
