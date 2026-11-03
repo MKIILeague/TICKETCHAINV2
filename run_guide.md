@@ -62,10 +62,13 @@ sending transactions needs Sepolia test ETH for gas, including gate staff.
 3. Return to the organizer. Create an event with a unique title, a future date,
    poster, small quantity (for example 5) and a nominal price (for example 0.001 ETH).
    Save a draft, preview, then publish. Wait for the wallet confirmation and receipt.
-4. Large event supplies are split into safe mint batches. Confirm each wallet
-   prompt and follow the minted/total progress. If cancelled or interrupted, use
+4. Large event supplies are split into safe mint batches. With the Privy embedded
+   wallet, confirm the publication once; the remaining batches run automatically.
+   Network gas is charged per batch. Follow the minted/total progress and use
+   **Stop after current batch** to pause. External wallets may prompt per batch.
+   If cancelled or interrupted, use
    **Resume publication** in Events; it checks a pending receipt and continues only
-   the remaining inventory. Use the same browser, where recovery is saved. If the
+   the remaining inventory, requesting fresh approval. Use the same browser, where recovery is saved. If the
    wallet submission's hash was lost, paste it into the recovery panel first.
    Do not create a duplicate event to repair a partial mint or database write.
 5. Sign into a buyer account. Open the event and buy two tickets. Confirm one

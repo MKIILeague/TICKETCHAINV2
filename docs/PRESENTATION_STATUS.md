@@ -2,7 +2,7 @@
 
 ## Current result
 
-Local source checks pass: 28 contract/mint-integration tests, 22 frontend logic tests, 9 backend
+Local source checks pass: 30 contract/mint-integration tests, 34 frontend logic tests, 9 backend
 authentication tests, ESLint and the production/PWA build. The frontend serves at
 http://localhost:5173, and the optional backend health check responds at port 5000.
 The protected backend profile rejects requests without an access token.
@@ -46,7 +46,9 @@ purchase/resale transactions and camera scans still require a manual rehearsal.
   successful even if its database inventory-counter update fails.
 - Event publication uses live gas estimates to split large supplies into capped
   transactions. It checkpoints each batch and its hash, verifies receipts, and
-  resumes from confirmed IDs after cancellation or connection loss. Recovery is
+  resumes from confirmed IDs after cancellation or connection loss. Privy embedded
+  wallets approve the remaining event supply once per Publish/Resume run; later
+  batches continue automatically. Recovery is
   stored in the same browser; storage must be writable before another batch is sent.
 - Admin actions check network, contract presence and actual on-chain ownership.
 - Corrected backend JWT verification to ES256, matching
@@ -77,6 +79,22 @@ requires the user to supply that hash, which is checked against the wallet,
 contract, event, metadata, price, quantity and nonce. A preparation with no submitted
 or confirmed mint can be discarded to edit the draft. Legacy sync-only recovery
 records remain supported.
+
+The user chose one publishing confirmation with automatic batches. For Privy
+embedded wallets, the first transaction modal explicitly authorizes the event's
+remaining ticket supply and explains the gas charged per batch. Later transactions
+use Privy's per-action `uiOptions.showWalletUIs: false`, supported by the installed
+SDK and [Privy's transaction UI documentation](https://docs.privy.io/recipes/react/manage-wallet-UIs).
+Global wallet confirmation settings were not changed. Other transaction flows and
+external-wallet fallback retain their existing prompts.
+
+`mintApproval.js` binds that one-run approval to the exact organizer, contract,
+network, metadata, event name, price, remaining supply and gas cap. It is held only
+in memory; a fresh Resume action requests approval again. A Stop control pauses
+after the current submitted batch, with receipts and remaining supply preserved.
+SDK recovery or MFA prompts can still occur if required by the wallet. Tests use a
+controlled SDK adapter and real local-chain mints; live signing remains a manual
+user action.
 
 This repair is frontend-only and works with the existing deployed contract. It
 must be committed and deployed to the hosted frontend before it changes the live

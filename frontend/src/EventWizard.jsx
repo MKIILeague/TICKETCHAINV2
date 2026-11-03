@@ -17,6 +17,8 @@ import { rm, ethLabel } from "./currency";
 import { readPendingPublish, savePendingPublish, clearPendingPublish } from "./publishRecovery";
 
 import { mintEventBatches } from "./mintBatches";
+import { createMintApprovalSender } from "./mintApproval";
+import { useSendTransaction } from "@privy-io/react-auth";
 
 const CATEGORIES = ["Concert", "Sports", "Theatre", "Conference"];
 
@@ -28,13 +30,14 @@ const STEPS = [
   { key: "sync", label: "Publishing event" },
 ];
 
-function MintProgress({ progress }) {
+function MintProgress({ progress, onStop, stopping }) {
   if (!progress) return null;
   return (
     <div className="space-y-2 text-sm" aria-live="polite">
       <p className="font-semibold">{progress.minted} / {progress.total} tickets confirmed</p>
       <progress aria-label="Tickets minted" value={progress.minted} max={progress.total} className="h-2 w-full accent-indigo-600" />
-      {progress.batchQuantity > 0 && <p>Next wallet confirmation: {progress.batchQuantity} tickets. Wait for its receipt before continuing.</p>}
+      {progress.batchQuantity > 0 && <p>Current batch: {progress.batchQuantity} tickets. Waiting for confirmation on-chain.</p>}
+      {onStop && <button onClick={onStop} disabled={stopping} className="rounded-lg border border-current px-3 py-1.5 text-xs font-semibold disabled:opacity-50">{stopping ? 'Stopping after current batch...' : 'Stop after current batch'}</button>}
     </div>
   );
 }
@@ -58,6 +61,9 @@ function formatEventDate(unixSec) {
  *  - Publish     → IPFS metadata → batchMintTickets → mutate status:"published"
  */
 export default function EventWizard({ wallet, walletAddress, orgData, isPaused, onPublished }) {
+  const { sendTransaction } = useSendTransaction();
+  const oneApproval = wallet?.walletClientType === "privy";
+  const [stopping, setStopping] = useState(false);
   const [pendingPublish, setPendingPublish] = useState(() => readPendingPublish(walletAddress));
   const pendingForWallet = pendingPublish?.walletAddress === walletAddress ? pendingPublish : null;
   const publishLock = useRef(false);
@@ -256,6 +262,7 @@ export default function EventWizard({ wallet, walletAddress, orgData, isPaused, 
       setPhase("chain");
       const controller = new AbortController();
       mintController.current = controller;
+      setStopping(false);
       let provider = new ethers.BrowserProvider(await wallet.getEthereumProvider());
       if (Number((await provider.getNetwork()).chainId) !== record.request.chainId) {
         await wallet.switchChain(record.request.chainId);
@@ -263,7 +270,8 @@ export default function EventWizard({ wallet, walletAddress, orgData, isPaused, 
       }
       const signer = await provider.getSigner();
       const contract = new ethers.Contract(record.request.contractAddress, CONTRACT_ABI, signer);
-      record = await mintEventBatches({ contract, record, save: checkpointMint, onProgress: setMintProgress, signal: controller.signal });
+      const sendBatch = oneApproval ? createMintApprovalSender({ contract, record, sendTransaction, signal: controller.signal }) : undefined;
+      record = await mintEventBatches({ contract, record, save: checkpointMint, onProgress: setMintProgress, signal: controller.signal, sendBatch });
     }
     setPhase("sync");
     await updateDoc(doc(db, "events", record.id), record.payload);
@@ -285,6 +293,11 @@ export default function EventWizard({ wallet, walletAddress, orgData, isPaused, 
       ? reason + " " + record.ticketIds.length + "/" + record.request.quantity + " tickets are confirmed. Resume below to mint only the remainder."
       : record ? "Tickets are already minted. Retry database publication below. " + reason : reason);
     if (record) setView("list");
+  };
+
+  const stopMinting = () => {
+    setStopping(true);
+    mintController.current?.abort();
   };
 
   const recoverPublish = async () => {
@@ -393,7 +406,7 @@ export default function EventWizard({ wallet, walletAddress, orgData, isPaused, 
             <p>{pendingForWallet.request
               ? "Publication in progress: " + pendingForWallet.request.eventName + ". Confirmed batches are saved."
               : "Tickets have already been minted. Finish database publication without minting again."}</p>
-            {pendingForWallet.request && <MintProgress progress={mintProgress || { minted: pendingForWallet.ticketIds.length, total: pendingForWallet.request.quantity }} />}
+            {pendingForWallet.request && <MintProgress progress={mintProgress || { minted: pendingForWallet.ticketIds.length, total: pendingForWallet.request.quantity }} onStop={phase === "chain" ? stopMinting : undefined} stopping={stopping} />}
             {pendingForWallet.pendingHash && <a href={"https://sepolia.etherscan.io/tx/" + pendingForWallet.pendingHash} target="_blank" rel="noreferrer" className="block underline">View the pending transaction</a>}
             {(pendingForWallet.submitting || pendingForWallet.pendingHash) && !busy && (
               <label className="block">If the wallet submission was interrupted, paste or correct its transaction hash to check it safely:
@@ -633,7 +646,8 @@ export default function EventWizard({ wallet, walletAddress, orgData, isPaused, 
           </div>
         )}
 
-        {phase === "chain" && <MintProgress progress={mintProgress} />}
+        <p className="text-sm text-slate-500">{oneApproval ? "Confirm once to publish this event. Its remaining mint batches run automatically, with network gas charged per batch. You can stop and resume." : "Your wallet may request a confirmation for each mint batch. Progress is saved so you can stop and resume."}</p>
+        {phase === "chain" && <MintProgress progress={mintProgress} onStop={stopMinting} stopping={stopping} />}
         {(busy || phase === "done") && (
           <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 space-y-2.5">
             {STEPS.map((s, i) => {
@@ -733,7 +747,7 @@ export default function EventWizard({ wallet, walletAddress, orgData, isPaused, 
             <div>
               <label className={labelCls}><Hash size={15} className="text-indigo-600" /> Total quantity *</label>
               <input type="number" min="1" step="1" value={form.totalSupply} onChange={set("totalSupply")} disabled={busy} placeholder="500" className={inputCls} />
-              <p className="mt-1.5 text-xs text-slate-500">Large events use several safe batches. Confirm each batch in your wallet; progress is saved for resuming.</p>
+              <p className="mt-1.5 text-xs text-slate-500">{oneApproval ? "Confirm once. Safe batches then run automatically; progress is saved for stopping and resuming." : "Large events use several safe batches. Confirm each batch in your wallet; progress is saved for resuming."}</p>
             </div>
             <div>
               <label className={labelCls}><DollarSign size={15} className="text-indigo-600" /> Ticket price (ETH) *</label>

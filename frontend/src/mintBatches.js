@@ -26,7 +26,7 @@ export async function planMintBatch(remaining, estimate, gasCap = TRANSACTION_GA
 
 const sameAddress = (a, b) => typeof a === 'string' && typeof b === 'string' && a.toLowerCase() === b.toLowerCase();
 
-export async function mintEventBatches({ contract, record, save, onProgress = () => {}, gasCap = TRANSACTION_GAS_CAP, signal }) {
+export async function mintEventBatches({ contract, record, save, onProgress = () => {}, gasCap = TRANSACTION_GAS_CAP, signal, sendBatch }) {
   let state = structuredClone(record);
   const request = state.request;
   if (!request || !Number.isSafeInteger(request.quantity) || request.quantity < 1 ||
@@ -113,11 +113,13 @@ export async function mintEventBatches({ contract, record, save, onProgress = ()
     }
     let tx;
     try {
-      tx = await contract.batchMintTickets(...mintArgs(batch.quantity), { gasLimit: batch.gasLimit });
+      tx = sendBatch
+        ? await sendBatch({ args: mintArgs(batch.quantity), gasLimit: batch.gasLimit, submissionNonce, confirmedQuantity: state.ticketIds.length })
+        : await contract.batchMintTickets(...mintArgs(batch.quantity), { gasLimit: batch.gasLimit });
     } catch (error) {
       // A rejected wallet prompt did not broadcast. Other ambiguous failures
       // retain the submission marker so reload/retry cannot blindly mint again.
-      if (error.code === 'ACTION_REJECTED') await checkpoint({ submitting: false, batchQuantity: null });
+      if (error.code === 'ACTION_REJECTED' || error.code === 'MINT_NOT_SUBMITTED') await checkpoint({ submitting: false, batchQuantity: null });
       throw error;
     }
     await checkpoint({ pendingHash: tx.hash, submitting: false, submissionNonce: tx.nonce ?? submissionNonce });

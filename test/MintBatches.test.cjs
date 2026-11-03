@@ -2,10 +2,11 @@ const { expect } = require('chai');
 const { ethers } = require('hardhat');
 
 describe('Resumable event minting', function () {
-  let contract, organizer, buyer, record, mintEventBatches;
+  let contract, organizer, buyer, record, mintEventBatches, createMintApprovalSender;
   const budget = 2_000_000n;
   before(async function () {
     ({ mintEventBatches } = await import('../frontend/src/mintBatches.js'));
+    ({ createMintApprovalSender } = await import('../frontend/src/mintApproval.js'));
   });
   beforeEach(async function () {
     const [owner, org, other] = await ethers.getSigners();
@@ -94,5 +95,35 @@ describe('Resumable event minting', function () {
     expect(saved.ticketIds).to.have.length(partial);
     await mintEventBatches({ contract, record: saved, gasCap: budget, save: (s) => { saved = s; } });
     expect(await contract.getNextTicketId()).to.equal(150n);
+  });
+  it('executes 150 real local-chain mints with one publishing confirmation', async function () {
+    const prompts = [];
+    const sendBatch = createMintApprovalSender({ contract, record,
+      sendTransaction: async (input, options) => {
+        prompts.push(options.uiOptions.showWalletUIs);
+        const tx = await organizer.sendTransaction(input);
+        return { hash: tx.hash };
+      },
+      waitForReceipt: (hash) => ethers.provider.getTransactionReceipt(hash),
+    });
+    await mintEventBatches({ contract, record, sendBatch, gasCap: budget, save: () => {} });
+    expect(await contract.getNextTicketId()).to.equal(150n);
+    expect(prompts.filter(Boolean)).to.have.length(1);
+    expect(prompts.length).to.be.greaterThan(1);
+  });
+  it('a stopped one-confirmation run requests fresh approval when resumed', async function () {
+    const prompts = [], controller = new AbortController(); let saved;
+    const sender = (state, signal) => createMintApprovalSender({ contract, record: state, signal,
+      sendTransaction: async (input, options) => {
+        prompts.push(options.uiOptions.showWalletUIs);
+        return { hash: (await organizer.sendTransaction(input)).hash };
+      }, waitForReceipt: (hash) => ethers.provider.getTransactionReceipt(hash),
+    });
+    await expect(mintEventBatches({ contract, record, sendBatch: sender(record, controller.signal), gasCap: budget,
+      signal: controller.signal, save: (s) => { saved = s; if (s.ticketIds.length) controller.abort(); },
+    })).to.be.rejectedWith('Publication paused');
+    await mintEventBatches({ contract, record: saved, sendBatch: sender(saved), gasCap: budget, save: () => {} });
+    expect(await contract.getNextTicketId()).to.equal(150n);
+    expect(prompts.filter(Boolean)).to.have.length(2);
   });
 });
