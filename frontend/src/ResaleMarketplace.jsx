@@ -1,3 +1,5 @@
+import { confirmTransaction, transactionError, sendContractTransaction } from "./transactions";
+import { createWalletProvider } from "./chainAccess";
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { ethers } from "ethers";
@@ -11,7 +13,7 @@ import { CONTRACT_ABI, PUBLIC_RPC_URL, getContractAddress, getDeployments } from
 import { fetchPublicEventStatusMap, normalizeEventName, isSaleBlocked, fetchEventStatusByName } from "./eventStatus";
 import { formatEventWindow } from "./dateFormat";
 import { ipfsToHttp } from "./ipfs";
-import { ticketKey } from "./ticketUtils";
+import { ticketKey, queryTicketLogs, ticketIssuers, isPrimaryInventory } from "./ticketUtils";
 import { fetchProfile } from "./profileStore";
 import { rm, ethLabel } from "./currency";
 
@@ -82,7 +84,7 @@ async function multicallRead(provider, contractAddress, iface, fn, argSets, chun
 async function getReadContext(wallet) {
   if (wallet) {
     try {
-      const provider = new ethers.BrowserProvider(await wallet.getEthereumProvider());
+      const provider = createWalletProvider(await wallet.getEthereumProvider());
       const chainId = Number((await provider.getNetwork()).chainId);
       if (import.meta.env.DEV && chainId === 31337) return { provider, chainId }; // local Hardhat node only
     } catch { /* fall through to public RPC */ }
@@ -202,6 +204,7 @@ export default function ResaleMarketplace({ walletAddress, wallet, connectWallet
       // log-range limits that some free RPCs impose on eth_getLogs.
       const total = Number(await withRetry(() => contract.getNextTicketId()));
       const ids = Array.from({ length: total }, (_, i) => i + 1);
+      const issuers = ticketIssuers(await queryTicketLogs(contract, contract.filters.TicketMinted(), deployment.startBlock));
 
       // Discover the peer-resale candidates: { id, details, owner }. On Sepolia we
       // batch the reads through Multicall3 (a few calls total); on localhost —
@@ -224,14 +227,7 @@ export default function ResaleMarketplace({ walletAddress, wallet, connectWallet
           const ownersArr = await multicallRead(provider, contractAddress, iface, "ownerOf", listed.map((l) => [l.id]));
           listed.forEach((l, i) => { l.owner = ownersArr[i]?.[0] || null; });
 
-          // 3) whitelistedOrganizers for each unique owner, batched — to drop
-          //    organizers' primary auto-listed inventory (peer resales only).
-          const uniqueOwners = [...new Set(listed.map((l) => l.owner).filter(Boolean).map((o) => o.toLowerCase()))];
-          const orgArr = await multicallRead(provider, contractAddress, iface, "whitelistedOrganizers", uniqueOwners.map((o) => [o]));
-          const orgMap = new Map();
-          uniqueOwners.forEach((o, i) => orgMap.set(o, !!orgArr[i]?.[0]));
-
-          candidates = listed.filter((l) => l.owner && !orgMap.get(l.owner.toLowerCase()));
+          candidates = listed.filter((l) => l.owner && !isPrimaryInventory(l.id, l.owner, issuers));
           mcSucceeded = true; // trust this result even if it's empty (no peer resales)
         } catch (mcErr) {
           console.warn("[resale] multicall path failed, falling back to per-token:", mcErr?.message);
@@ -242,20 +238,12 @@ export default function ResaleMarketplace({ walletAddress, wallet, connectWallet
       // bounded-concurrency per-token scan. NOT run when multicall succeeded with
       // zero results — that's a legitimately empty resale board.
       if (!mcSucceeded) {
-        const orgCache = new Map();
-        const isOrganizer = async (addr) => {
-          const key = addr.toLowerCase();
-          if (orgCache.has(key)) return orgCache.get(key);
-          const res = await withRetry(() => contract.whitelistedOrganizers(addr)).catch(() => false);
-          orgCache.set(key, res);
-          return res;
-        };
         candidates = (await mapLimit(ids, 6, async (id) => {
           try {
             const details = await withRetry(() => contract.getTicketDetails(id));
             if (!details.isForResale || details.isUsed) return null;
             const owner = await withRetry(() => contract.ownerOf(id));
-            if (await isOrganizer(owner)) return null;
+            if (isPrimaryInventory(id, owner, issuers)) return null;
             return { id, details, owner };
           } catch { return null; }
         })).filter(Boolean);
@@ -276,6 +264,7 @@ export default function ResaleMarketplace({ walletAddress, wallet, connectWallet
           // an otherwise-valid token belongs to a voided event.
           eventStatus: entry?.status || null,
           resalePrice: parseFloat(ethers.formatEther(details.resalePrice || 0n)),
+          resalePriceWei: details.resalePrice.toString(),
           originalPrice: parseFloat(ethers.formatEther(details.originalPrice || 0n)),
           banner: meta?.imageHash ? ipfsToHttp(meta.imageHash) : "",
           venue: meta?.venue || "Venue TBA",
@@ -318,6 +307,7 @@ export default function ResaleMarketplace({ walletAddress, wallet, connectWallet
   useEffect(() => { void Promise.resolve().then(load); }, [load, walletAddress]);
 
   const handleBuy = async (listing) => {
+    if (buyingId) return;
     if (!wallet || !walletAddress) { connectWallet?.(); return; }
     if (listing.owner.toLowerCase() === walletAddress.toLowerCase()) return; // can't buy your own
     setBuyingId(ticketKey(listing));
@@ -325,21 +315,13 @@ export default function ResaleMarketplace({ walletAddress, wallet, connectWallet
     try {
       if (isSaleBlocked(await fetchEventStatusByName(listing.eventTitle, { strict: true }))) throw new Error("This event is no longer on sale.");
       let eip = await wallet.getEthereumProvider();
-      let provider = new ethers.BrowserProvider(eip);
+      let provider = createWalletProvider(eip);
       const currentChainId = Number((await provider.getNetwork()).chainId);
       const targetChainId = listing.chainId;
       if (currentChainId !== targetChainId) {
         await wallet.switchChain(targetChainId);
         eip = await wallet.getEthereumProvider();
-        provider = new ethers.BrowserProvider(eip);
-      }
-
-      // Demo mode: the swap executes with zero value, so we only need a gas buffer.
-      const balance = await provider.getBalance(walletAddress);
-      if (parseFloat(ethers.formatEther(balance)) < 0.0005) {
-        setError(`Insufficient funds for gas. Top up a little Sepolia ETH and try again.`);
-        setBuyingId(null);
-        return;
+        provider = createWalletProvider(eip);
       }
 
       const signer = await provider.getSigner();
@@ -348,15 +330,16 @@ export default function ResaleMarketplace({ walletAddress, wallet, connectWallet
       if (currentOwner.toLowerCase() !== listing.owner.toLowerCase()) throw new Error("The seller has changed. Refresh the listings.");
       const details = await contract.getTicketDetails(listing.id);
       if (details.isUsed || !details.isForResale) throw new Error("This ticket is no longer available.");
-      const tx = await contract.purchaseResaleTicket(listing.id, { value: 0n });
-      await tx.wait();
+      if (details.resalePrice.toString() !== listing.resalePriceWei) throw new Error('The listing price changed. Refresh the listings before purchasing.');
+      const tx = await sendContractTransaction(contract, "purchaseResaleTicket", [listing.id]);
+      await confirmTransaction(tx);
 
       // On-chain ownership is now the buyer's; the wallet view reads chain state,
       // so the ticket appears in "My Tickets" with its QR and drops out of here.
       navigate("/wallet", { state: { purchased: 1, eventTitle: listing.eventTitle } });
     } catch (err) {
       console.error("[resale] purchase failed:", err);
-      const reason = err?.reason || err?.data?.message || err?.message || "Transaction failed";
+      const reason = transactionError(err);
       if (err?.code === "ACTION_REJECTED" || /rejected|denied/i.test(reason)) {
         setError("You cancelled the purchase.");
       } else {

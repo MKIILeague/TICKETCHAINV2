@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { BrowserRouter, Routes, Route, Outlet, NavLink, Link, Navigate } from "react-router-dom";
+import { BrowserRouter, Routes, Route, Outlet, NavLink, Link, Navigate, useParams } from "react-router-dom";
 import { LogIn, LogOut, Building2, Menu, X, User, Repeat } from "lucide-react";
 import BrandMark from "./BrandMark";
 import { useTicketWallet } from "./useTicketWallet";
@@ -212,7 +212,8 @@ function ResalePage() {
 }
 function EventCheckoutPage() {
   const p = useChainProps();
-  return <EventCheckout {...p} />;
+  const { eventId } = useParams();
+  return <EventCheckout key={eventId} {...p} />;
 }
 function OrganizerEntryPage() {
   const p = useChainProps();

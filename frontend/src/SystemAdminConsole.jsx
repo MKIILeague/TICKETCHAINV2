@@ -1,5 +1,7 @@
+import { confirmTransaction, transactionError, sendContractTransaction, setOrganizerAccess } from "./transactions";
 import { useState, useEffect, useCallback, useRef } from "react";
 import { ethers } from "ethers";
+import { useWallets, useConnectWallet } from "@privy-io/react-auth";
 import {
   ShieldAlert, UserMinus, Activity,
   BarChart3, Lock, Unlock, RefreshCw, CheckCircle2,
@@ -8,7 +10,7 @@ import {
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { CONTRACT_ABI, getContractAddress } from "./constants";
-import { getAdminContract } from "./chainAccess";
+import { createWalletProvider, getAdminContract, getReadProvider } from "./chainAccess";
 import { db } from "./firebase";
 import {
   collection, getDocs, doc, updateDoc, serverTimestamp, query, orderBy
@@ -64,7 +66,20 @@ const ToastStack = ({ toasts, dismiss }) => {
   );
 };
 
-const SystemAdminConsole = ({ walletAddress, wallet, connectWallet }) => {
+const SystemAdminConsole = ({ wallet: sessionWallet, connectWallet }) => {
+  const { wallets } = useWallets();
+  const [ownerAddress, setOwnerAddress] = useState("");
+  const [selectedWallet, setSelectedWallet] = useState("");
+  const [chainError, setChainError] = useState("");
+  const [chainReady, setChainReady] = useState(false);
+  const { connectWallet: connectOwnerWallet } = useConnectWallet({
+    onSuccess: ({ wallet: connected }) => setSelectedWallet(connected.address),
+  });
+  const availableWallets = wallets || [];
+  const wallet = availableWallets.find((w) => w.address.toLowerCase() === selectedWallet.toLowerCase())
+    || availableWallets.find((w) => w.address.toLowerCase() === ownerAddress.toLowerCase()) || sessionWallet;
+  const walletAddress = wallet?.address;
+  const ownerMatches = chainReady && walletAddress?.toLowerCase() === ownerAddress.toLowerCase();
   const walletRef = useRef(wallet);
   useEffect(() => { walletRef.current = wallet; }, [wallet]);
   const [gatekeeperAddress, setGatekeeperAddress] = useState("");
@@ -100,24 +115,26 @@ const SystemAdminConsole = ({ walletAddress, wallet, connectWallet }) => {
   // ── Fetch on-chain data ──
   const fetchChainData = useCallback(async () => {
     const wallet = walletRef.current;
-    if (!wallet || !walletAddress) return;
     try {
-      const eip1193Provider = await wallet.getEthereumProvider();
-      const provider = new ethers.BrowserProvider(eip1193Provider);
-      const network = await provider.getNetwork();
-      const currentChainId = Number(network.chainId);
+      const currentChainId = import.meta.env.DEV && wallet && Number(wallet.chainId?.split(':').pop()) === 31337 ? 31337 : 11155111;
+      const provider = getReadProvider(currentChainId);
       const contractAddress = getContractAddress(currentChainId);
       const contract = new ethers.Contract(contractAddress, CONTRACT_ABI, provider);
-      const paused = await contract.paused();
+      const [paused, owner, balance] = await Promise.all([contract.paused(), contract.owner(), provider.getBalance(contractAddress)]);
       setIsPaused(paused);
-      try { await contract.gatekeepers(walletAddress); setSupportsGatekeepers(true); }
-      catch { setSupportsGatekeepers(false); }
-      const balance = await provider.getBalance(contractAddress);
+      setOwnerAddress(owner);
+      try { await contract.gatekeepers(owner); setSupportsGatekeepers(true); }
+      catch (error) {
+        if (error.code !== 'CALL_EXCEPTION' && error.code !== 'BAD_DATA') throw error;
+        setSupportsGatekeepers(false);
+      }
       setPlatformBalance(ethers.formatEther(balance));
+      setChainError(""); setChainReady(true);
     } catch (err) {
       console.error("Chain fetch error:", err);
+      setChainError(err.shortMessage || err.message); setChainReady(false);
     }
-  }, [walletAddress]);
+  }, []);
 
   // ── Combined refresh (used on mount + manual button) ──
   const refreshAll = useCallback(async ({ silent = false } = {}) => {
@@ -147,21 +164,18 @@ const SystemAdminConsole = ({ walletAddress, wallet, connectWallet }) => {
       // Whitelist organizer on-chain first
       const contract = await getAdminContract(wallet);
 
-      const tx = await contract.whitelistOrganizer(org.id);
-      await tx.wait();
-
-      // Update Firestore
-      await updateDoc(doc(db, "organisers", org.id), {
+      const result = await setOrganizerAccess(contract, org.id, true, () => updateDoc(doc(db, "organisers", org.id), {
         status: "approved",
         reviewedAt: new Date().toISOString(),
-      });
+      }));
+      if (!result.synced) { push("info", "Organizer approved on-chain. Database sync failed; press Approve again to retry the database update without another transaction."); return; }
 
       await fetchOrganisers();
       setSelectedOrg(null);
       push("success", `${org.organizationName} approved and whitelisted on-chain.`);
     } catch (err) {
       console.error("Approval failed:", err);
-      push("error", `Approval failed: ${err.reason || err.message || "Unknown error"}`);
+      push("error", `Approval failed: ${transactionError(err)}`);
     } finally {
       setActionLoading(null);
     }
@@ -178,12 +192,15 @@ const SystemAdminConsole = ({ walletAddress, wallet, connectWallet }) => {
       }
       const contract = await getAdminContract(wallet);
 
-      const tx = await contract.whitelistOrganizer(org.id);
-      await tx.wait();
+      const result = await setOrganizerAccess(contract, org.id, true, () => updateDoc(doc(db, "organisers", org.id), {
+        status: "approved", reviewedAt: new Date().toISOString(),
+      }));
+      if (!result.synced) { push("info", "Whitelist confirmed on-chain. Database sync failed; retry Sync Whitelist to finish."); return; }
+      await fetchOrganisers();
       push("success", `${org.organizationName} whitelisted on-chain.`);
     } catch (err) {
       console.error("Whitelisting failed:", err);
-      push("error", `Whitelisting failed: ${err.reason || err.message || "Unknown error"}`);
+      push("error", `Whitelisting failed: ${transactionError(err)}`);
     } finally {
       setActionLoading(null);
     }
@@ -223,19 +240,16 @@ const SystemAdminConsole = ({ walletAddress, wallet, connectWallet }) => {
       // Revoke organizer on-chain first
       const contract = await getAdminContract(wallet);
 
-      const tx = await contract.revokeOrganizer(org.id);
-      await tx.wait();
-
-      // Update Firestore
-      await updateDoc(doc(db, "organisers", org.id), {
+      const result = await setOrganizerAccess(contract, org.id, false, () => updateDoc(doc(db, "organisers", org.id), {
         status: "rejected",
         reviewedAt: new Date().toISOString(),
-      });
+      }));
+      if (!result.synced) { push("info", "Access revoked on-chain. Database sync failed; press Revoke again to finish the database update."); return; }
       await fetchOrganisers();
       push("info", `Access revoked for ${org.organizationName}.`);
     } catch (err) {
       console.error("Revoke failed:", err);
-      push("error", `Revoke failed: ${err.reason || err.message || "Unknown error"}`);
+      push("error", `Revoke failed: ${transactionError(err)}`);
     } finally {
       setActionLoading(null);
     }
@@ -247,13 +261,13 @@ const SystemAdminConsole = ({ walletAddress, wallet, connectWallet }) => {
     setLoading(true);
     try {
       const contract = await getAdminContract(wallet);
-      const tx = isPaused ? await contract.unpause() : await contract.pause();
-      await tx.wait();
+      const tx = await sendContractTransaction(contract, isPaused ? "unpause" : "pause");
+      await confirmTransaction(tx);
       setIsPaused(!isPaused);
       push(isPaused ? "success" : "info", isPaused ? "Protocol resumed." : "Protocol frozen. All minting/transfers halted.");
     } catch (err) {
       console.error("Circuit breaker failed:", err);
-      push("error", err.reason || "Unauthorized: Only Owner can toggle.");
+      push("error", transactionError(err));
     } finally {
       setLoading(false);
     }
@@ -264,10 +278,10 @@ const SystemAdminConsole = ({ walletAddress, wallet, connectWallet }) => {
     setGatekeeperBusy(true);
     try {
       const contract = await getAdminContract(wallet);
-      const tx = await contract.setGatekeeper(gatekeeperAddress, allowed);
-      await tx.wait();
+      const tx = await sendContractTransaction(contract, "setGatekeeper", [gatekeeperAddress, allowed]);
+      await confirmTransaction(tx);
       push("success", allowed ? "Gatekeeper authorized on-chain." : "Gatekeeper access revoked on-chain.");
-    } catch (error) { push("error", error.reason || error.shortMessage || error.message); }
+    } catch (error) { push("error", transactionError(error)); }
     finally { setGatekeeperBusy(false); }
   };
 
@@ -298,7 +312,7 @@ const SystemAdminConsole = ({ walletAddress, wallet, connectWallet }) => {
               <h1 className="text-2xl sm:text-3xl font-black text-slate-900 tracking-tighter uppercase">Admin Console</h1>
               <p className="text-[11px] text-slate-500 font-mono flex items-center gap-2 truncate">
                 <Activity size={12} className={isPaused ? "text-red-500" : "text-emerald-500 animate-pulse"} />
-                Runtime: {isPaused ? "FROZEN" : "Healthy"}
+                Runtime: {!chainReady ? "Checking connection" : isPaused ? "FROZEN" : "Connected"}
                 {walletAddress && <span className="hidden sm:inline">· {walletAddress.substring(0, 14)}…</span>}
               </p>
             </div>
@@ -325,6 +339,18 @@ const SystemAdminConsole = ({ walletAddress, wallet, connectWallet }) => {
         </div>
       </header>
       <section className="max-w-7xl mx-auto px-4 sm:px-8 pt-6">
+        <div className="mb-4 rounded-2xl border border-slate-200 bg-white p-5 text-sm text-slate-700">
+          <p className="font-semibold">Contract owner wallet</p>
+          <p className="mt-1 break-all font-mono text-xs">{ownerAddress || 'Loading owner...'}</p>
+          {chainError && <p role="alert" className="mt-2 text-red-600">Could not verify the contract: {chainError}</p>}
+          {chainReady && <p className="mt-2">{ownerMatches ? 'Owner wallet connected. On-chain admin actions are available.' : 'Connect this owner wallet to approve organizers or pause the contract. Admin email access alone cannot authorize blockchain changes.'}</p>}
+          <div className="mt-3 flex flex-wrap gap-2">
+            {availableWallets.length > 1 && <select aria-label="Admin signing wallet" value={walletAddress || ''} onChange={(e) => setSelectedWallet(e.target.value)} className="min-w-0 max-w-full rounded-lg border border-slate-200 p-2 text-xs">
+              {availableWallets.map((w) => <option key={w.address} value={w.address}>{w.address}</option>)}
+            </select>}
+            <button onClick={() => connectOwnerWallet()} className="rounded-lg border border-indigo-200 px-3 py-2 text-xs text-indigo-700">Connect owner wallet</button>
+          </div>
+        </div>
         <div className="rounded-2xl border border-slate-200 bg-white p-5">
           <h2 className="text-sm font-semibold text-slate-900">Gatekeeper authorization</h2>
           {supportsGatekeepers === false ? (
@@ -334,8 +360,8 @@ const SystemAdminConsole = ({ walletAddress, wallet, connectWallet }) => {
               <p className="mt-1 text-xs text-slate-500">After assigning a staff email in the organizer dashboard, authorize their wallet here to record entry on-chain.</p>
               <div className="mt-3 flex flex-wrap gap-2">
                 <input aria-label="Gatekeeper wallet address" value={gatekeeperAddress} onChange={(e) => setGatekeeperAddress(e.target.value)} placeholder="0x..." className="min-w-0 flex-1 border border-slate-200 rounded-lg p-2 text-sm font-mono" />
-                <button disabled={gatekeeperBusy || supportsGatekeepers !== true} onClick={() => handleGatekeeper(true)} className="rounded-lg bg-indigo-600 px-4 py-2 text-sm text-white disabled:opacity-40">Authorize</button>
-                <button disabled={gatekeeperBusy || supportsGatekeepers !== true} onClick={() => handleGatekeeper(false)} className="rounded-lg border border-red-200 px-4 py-2 text-sm text-red-600 disabled:opacity-40">Revoke</button>
+                <button disabled={gatekeeperBusy || supportsGatekeepers !== true || !ownerMatches} onClick={() => handleGatekeeper(true)} className="rounded-lg bg-indigo-600 px-4 py-2 text-sm text-white disabled:opacity-40">Authorize</button>
+                <button disabled={gatekeeperBusy || supportsGatekeepers !== true || !ownerMatches} onClick={() => handleGatekeeper(false)} className="rounded-lg border border-red-200 px-4 py-2 text-sm text-red-600 disabled:opacity-40">Revoke</button>
               </div>
             </>
           )}
@@ -472,7 +498,7 @@ const SystemAdminConsole = ({ walletAddress, wallet, connectWallet }) => {
                             <>
                               <button
                                 onClick={() => handleApprove(org)}
-                                disabled={actionLoading === org.id}
+                                disabled={!!actionLoading || !ownerMatches}
                                 className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 disabled:bg-slate-200 disabled:text-slate-400 text-white rounded-xl text-xs font-black uppercase tracking-widest transition-all flex items-center gap-1.5 shadow-sm shadow-emerald-500/20"
                               >
                                 {actionLoading === org.id ? <RefreshCw size={12} className="animate-spin" /> : <CheckCircle2 size={12} />}
@@ -480,7 +506,7 @@ const SystemAdminConsole = ({ walletAddress, wallet, connectWallet }) => {
                               </button>
                               <button
                                 onClick={() => handleReject(org)}
-                                disabled={actionLoading === org.id}
+                                disabled={!!actionLoading || !ownerMatches}
                                 className="px-4 py-2 bg-red-50 hover:bg-red-100 text-red-600 border border-red-200 rounded-xl text-xs font-black uppercase tracking-widest transition-all flex items-center gap-1.5"
                               >
                                 <XCircle size={12} /> Reject
@@ -492,7 +518,7 @@ const SystemAdminConsole = ({ walletAddress, wallet, connectWallet }) => {
                             <>
                               <button
                                 onClick={() => handleWhitelistOnly(org)}
-                                disabled={actionLoading === org.id}
+                                disabled={!!actionLoading || !ownerMatches}
                                 className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-black uppercase tracking-widest transition-all flex items-center gap-1.5 shadow-lg shadow-indigo-500/10"
                               >
                                 {actionLoading === org.id ? <RefreshCw size={12} className="animate-spin" /> : <CheckCircle2 size={12} />}
@@ -500,7 +526,7 @@ const SystemAdminConsole = ({ walletAddress, wallet, connectWallet }) => {
                               </button>
                               <button
                                 onClick={() => handleRevoke(org)}
-                                disabled={actionLoading === org.id}
+                                disabled={!!actionLoading || !ownerMatches}
                                 className="px-4 py-2 bg-red-50 hover:bg-red-100 text-red-600 border border-red-200 rounded-xl text-xs font-black uppercase tracking-widest transition-all flex items-center gap-1.5"
                               >
                                 {actionLoading === org.id ? <RefreshCw size={12} className="animate-spin" /> : <UserMinus size={12} />}
@@ -571,7 +597,7 @@ const SystemAdminConsole = ({ walletAddress, wallet, connectWallet }) => {
                 </span>
                 <button
                   onClick={handleTogglePause}
-                  disabled={loading}
+                  disabled={loading || !ownerMatches}
                   className={`w-20 h-10 rounded-full p-1 transition-all relative ${isPaused ? "bg-red-500" : "bg-slate-300"}`}
                 >
                   <motion.div
@@ -586,32 +612,33 @@ const SystemAdminConsole = ({ walletAddress, wallet, connectWallet }) => {
 
             {/* Deployer Funding Card */}
             <section className="bg-white border border-slate-200 p-7 rounded-3xl shadow-sm relative">
-              <h4 className="text-sm font-black text-slate-900 uppercase tracking-tight">Deployer Gas Manager</h4>
-              <p className="text-[10px] text-slate-500 mt-1 uppercase font-bold tracking-widest">Fund Sepolia Contract Deployer</p>
+              <h4 className="text-sm font-black text-slate-900 uppercase tracking-tight">Owner Gas Manager</h4>
+              <p className="text-[10px] text-slate-500 mt-1 uppercase font-bold tracking-widest">Fund Sepolia Contract Owner</p>
               <p className="text-xs text-slate-600 leading-relaxed mt-3 mb-4">
-                The smart contract deployer wallet needs gas to deploy contract updates or run whitelisting sync scripts on Sepolia. Fund the deployer wallet <span className="font-mono text-indigo-600 font-bold break-all">0x081c0e3CD35eE02a69F6423439A2BEB1F6C22BFF</span> with 0.005 Sepolia ETH.
+                The contract owner wallet pays gas for organizer approvals and admin actions. Fund the owner wallet <span className="font-mono text-indigo-600 font-bold break-all">{ownerAddress || "Loading..."}</span> with 0.005 Sepolia ETH.
               </p>
               <button
                 onClick={async () => {
                   if (!wallet) { push("error", "Please connect your admin wallet first."); return; }
                   try {
                     const eip1193Provider = await wallet.getEthereumProvider();
-                    const provider = new ethers.BrowserProvider(eip1193Provider);
+                    const provider = createWalletProvider(eip1193Provider);
                     const signer = await provider.getSigner();
                     const tx = await signer.sendTransaction({
-                      to: "0x081c0e3CD35eE02a69F6423439A2BEB1F6C22BFF",
+                      to: ownerAddress,
                       value: ethers.parseEther("0.005")
                     });
                     push("info", `Transaction sent: ${tx.hash.substring(0, 18)}…`);
-                    await tx.wait();
-                    push("success", "Deployer wallet funded successfully.");
+                    await confirmTransaction(tx);
+                    push("success", "Owner wallet funded successfully.");
                   } catch (e) {
-                    push("error", e.message || "Failed to fund deployer.");
+                    push("error", transactionError(e));
                   }
                 }}
-                className="w-full bg-indigo-600 hover:bg-indigo-700 text-white py-3 rounded-xl text-xs font-bold uppercase tracking-widest transition-all shadow-lg shadow-indigo-500/20"
+                disabled={!ownerAddress || !wallet || loading}
+                className="w-full bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 text-white py-3 rounded-xl text-xs font-bold uppercase tracking-widest transition-all shadow-lg shadow-indigo-500/20"
               >
-                Send 0.005 ETH to Deployer
+                Send 0.005 Sepolia ETH to Owner
               </button>
             </section>
 

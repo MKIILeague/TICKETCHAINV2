@@ -1,3 +1,5 @@
+import { confirmTransaction, transactionError, sendContractTransaction } from "./transactions";
+import { createWalletProvider } from "./chainAccess";
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useLocation, Link } from "react-router-dom";
 import { ethers } from "ethers";
@@ -18,7 +20,7 @@ import { formatEventWindow } from "./dateFormat";
 import heroSlideConfetti from "./assets/slides/slide3.jpeg";
 import heroSlideStage from "./assets/slides/slide1.jpg";
 import heroSlideAerial from "./assets/slides/slide2.jpeg";
-import { ownedTokenIds, ticketKey, queryTicketLogs } from "./ticketUtils";
+import { ownedTokenIds, ticketKey, queryTicketLogs, ticketIssuers, isPrimaryInventory } from "./ticketUtils";
 import { QRCodeSVG } from "qrcode.react";
 import { rm, ethLabel } from "./currency";
 
@@ -90,6 +92,8 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
   // is a real Sepolia transaction (15-30s), so the button it was pressed from
   // has to show it's working — otherwise the click looks like it did nothing.
   const [cancelingId, setCancelingId] = useState(null);
+  const ticketActionLock = useRef(false);
+  const [ticketActionBusy, setTicketActionBusy] = useState(false);
 
   // Wallet specific states
   const [ethBalance, setEthBalance] = useState("0.00");
@@ -131,7 +135,7 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
       });
 
       addNotification("Localhost ETH transaction sent. Waiting for block confirmation...", "info");
-      await tx.wait();
+      await confirmTransaction(tx);
       addNotification("Received 10.0 Localhost ETH! Your wallet is now funded.", "success");
       fetchDashboardData();
     } catch (err) {
@@ -158,14 +162,14 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
     setIsSendingEth(true);
     try {
       const eip1193Provider = await wallet.getEthereumProvider();
-      const provider = new ethers.BrowserProvider(eip1193Provider);
+      const provider = createWalletProvider(eip1193Provider);
       const signer = await provider.getSigner();
 
       const tx = await signer.sendTransaction({
         to: toAddress,
         value: ethers.parseEther(amount.toString())
       });
-      await tx.wait();
+      await confirmTransaction(tx);
       addNotification("ETH sent successfully!", "success");
       setShowSendModal(false);
       setSendRecipient("");
@@ -173,7 +177,7 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
       fetchDashboardData();
     } catch (error) {
       console.error("Send ETH failed:", error);
-      addNotification(error.reason || "Transaction failed", "error");
+      addNotification(transactionError(error), "error");
     } finally {
       setIsSendingEth(false);
     }
@@ -204,7 +208,7 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
       let walletProvider = null;        // the wallet's own RPC (reliable for logs)
       if (wallet) {
         try {
-          walletProvider = new ethers.BrowserProvider(await wallet.getEthereumProvider());
+          walletProvider = createWalletProvider(await wallet.getEthereumProvider());
           const walletChain = Number((await walletProvider.getNetwork()).chainId);
           if (walletChain === 11155111 || (allowLocal && walletChain === 31337)) {
             chainId = walletChain;
@@ -292,12 +296,13 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
       const perContract = await Promise.all(deployments.map(async (dep) => {
         try {
           const c = new ethers.Contract(dep.address, CONTRACT_ABI, provider);
-          const [incoming, outgoing] = await Promise.all([
+          const [incoming, outgoing, minted] = await Promise.all([
             queryTicketLogs(c, c.filters.Transfer(null, walletAddress), dep.startBlock),
             queryTicketLogs(c, c.filters.Transfer(walletAddress, null), dep.startBlock),
+            queryTicketLogs(c, c.filters.TicketMinted(), dep.startBlock),
           ]);
           const owned = ownedTokenIds(incoming, outgoing, walletAddress);
-          const iAmOrganizer = await c.whitelistedOrganizers(walletAddress).catch(() => false);
+          const issuers = ticketIssuers(minted);
           const rows = await mapLimit([...owned], 4, async (id) => {
             try {
               const details = await withRetry(() => c.getTicketDetails(id));
@@ -311,7 +316,7 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
                 isListed: details.isForResale || false,
                 resalePrice: details.resalePrice ? parseFloat(ethers.formatEther(details.resalePrice)) : 0,
                 owner: walletAddress,
-                isPrimary: iAmOrganizer,
+                isPrimary: isPrimaryInventory(id, walletAddress, issuers),
                 category: "VIP",
                 imageUri: "https://images.unsplash.com/photo-1540039155732-68473500d6cb?q=80&w=800&auto=format&fit=crop",
                 date: "Oct 24, 2026",
@@ -377,15 +382,16 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
 
   const onListResale = async (ticket, price) => {
     const ticketId = ticket.id;
-    if (!wallet) return;
+    if (!wallet || ticketActionLock.current) return false;
     const resaleTarget = ticket;
     if (resaleTarget && isTransferFrozen(statusFor(resaleTarget.eventTitle))) {
       addNotification("This event was canceled — resale and transfers are frozen.", "error");
       return false;
     }
+    ticketActionLock.current = true; setTicketActionBusy(true);
     try {
       let eip1193Provider = await wallet.getEthereumProvider();
-      let provider = new ethers.BrowserProvider(eip1193Provider);
+      let provider = createWalletProvider(eip1193Provider);
 
       const network = await provider.getNetwork();
       const currentChainId = Number(network.chainId);
@@ -395,44 +401,39 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
       if (currentChainId !== targetChainId) {
         await wallet.switchChain(targetChainId);
         eip1193Provider = await wallet.getEthereumProvider();
-        provider = new ethers.BrowserProvider(eip1193Provider);
-      }
-
-      // Pre-flight gas check
-      const balance = await provider.getBalance(walletAddress);
-      const balanceInEth = parseFloat(ethers.formatEther(balance));
-      const requiredGas = 0.0003;
-
-      if (balanceInEth < requiredGas) {
-        addNotification(`❌ Insufficient funds for gas!\n\nYou currently have ${balanceInEth.toFixed(4)} ETH, but you need at least ${requiredGas} ETH to send this transaction.`, "error");
-        return false;
+        provider = createWalletProvider(eip1193Provider);
       }
 
       const signer = await provider.getSigner();
       const contractAddress = contractForTicket(ticket);
       const contract = new ethers.Contract(contractAddress, CONTRACT_ABI, signer);
       const priceInWei = ethers.parseEther(price.toString());
-      const tx = await contract.listTicketForResale(ticketId, priceInWei);
-      await tx.wait();
+      const [live, owner] = await Promise.all([contract.getTicketDetails(ticketId), contract.ownerOf(ticketId)]);
+      if (owner.toLowerCase() !== walletAddress.toLowerCase()) throw new Error('You no longer own this ticket. Refresh your wallet.');
+      if (live.isUsed) throw new Error('A used ticket cannot be listed.');
+      if (priceInWei < 0n || priceInWei > live.originalPrice * 110n / 100n) throw new Error('Enter a price from zero up to the 110% resale cap.');
+      const tx = await sendContractTransaction(contract, "listTicketForResale", [ticketId, priceInWei]);
+      await confirmTransaction(tx);
       addNotification("Ticket listed for resale!", "success");
       fetchDashboardData();
       return true;
     } catch (error) {
       console.error("Resale failed:", error);
-      addNotification(error.reason || error.message || "Transaction failed", "error");
+      addNotification(transactionError(error), "error");
       return false;
-    }
+    } finally { ticketActionLock.current = false; setTicketActionBusy(false); }
   };
 
   // Returns true only if the listing was actually cancelled on-chain, so the
   // caller knows whether it's safe to close the popup it was pressed from.
   const onCancelResale = async (ticket) => {
     const ticketId = ticket.id;
-    if (!wallet) return false;
+    if (!wallet || ticketActionLock.current) return false;
+    ticketActionLock.current = true; setTicketActionBusy(true);
     setCancelingId(ticketKey(ticket));
     try {
       let eip1193Provider = await wallet.getEthereumProvider();
-      let provider = new ethers.BrowserProvider(eip1193Provider);
+      let provider = createWalletProvider(eip1193Provider);
 
       const network = await provider.getNetwork();
       const currentChainId = Number(network.chainId);
@@ -442,47 +443,39 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
       if (currentChainId !== targetChainId) {
         await wallet.switchChain(targetChainId);
         eip1193Provider = await wallet.getEthereumProvider();
-        provider = new ethers.BrowserProvider(eip1193Provider);
-      }
-
-      // Pre-flight gas check
-      const balance = await provider.getBalance(walletAddress);
-      const balanceInEth = parseFloat(ethers.formatEther(balance));
-      const requiredGas = 0.0003;
-
-      if (balanceInEth < requiredGas) {
-        addNotification(`❌ Insufficient funds for gas!\n\nYou currently have ${balanceInEth.toFixed(4)} ETH, but you need at least ${requiredGas} ETH to send this transaction.`, "error");
-        return false;
+        provider = createWalletProvider(eip1193Provider);
       }
 
       const signer = await provider.getSigner();
       const contractAddress = contractForTicket(ticket);
       const contract = new ethers.Contract(contractAddress, CONTRACT_ABI, signer);
-      const tx = await contract.cancelResaleListing(ticketId);
-      await tx.wait();
+      const tx = await sendContractTransaction(contract, "cancelResaleListing", [ticketId]);
+      await confirmTransaction(tx);
       addNotification("Listing cancelled", "success");
       fetchDashboardData();
       return true;
     } catch (error) {
       console.error("Cancel failed:", error);
-      addNotification(error.reason || error.message || "Transaction failed", "error");
+      addNotification(transactionError(error), "error");
       return false;
     } finally {
       setCancelingId(null);
+      ticketActionLock.current = false; setTicketActionBusy(false);
     }
   };
 
   const onTransfer = async (ticket, toAddress) => {
     const ticketId = ticket.id;
-    if (!wallet) return;
+    if (!wallet || ticketActionLock.current) return false;
     const transferTarget = ticket;
     if (transferTarget && isTransferFrozen(statusFor(transferTarget.eventTitle))) {
       addNotification("This event was canceled — transfers are frozen.", "error");
       return false;
     }
+    ticketActionLock.current = true; setTicketActionBusy(true);
     try {
       let eip1193Provider = await wallet.getEthereumProvider();
-      let provider = new ethers.BrowserProvider(eip1193Provider);
+      let provider = createWalletProvider(eip1193Provider);
 
       const network = await provider.getNetwork();
       const currentChainId = Number(network.chainId);
@@ -492,39 +485,31 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
       if (currentChainId !== targetChainId) {
         await wallet.switchChain(targetChainId);
         eip1193Provider = await wallet.getEthereumProvider();
-        provider = new ethers.BrowserProvider(eip1193Provider);
-      }
-
-      // Pre-flight gas check
-      const balance = await provider.getBalance(walletAddress);
-      const balanceInEth = parseFloat(ethers.formatEther(balance));
-      const requiredGas = 0.0003;
-
-      if (balanceInEth < requiredGas) {
-        addNotification(`❌ Insufficient funds for gas!\n\nYou currently have ${balanceInEth.toFixed(4)} ETH, but you need at least ${requiredGas} ETH to send this transaction.`, "error");
-        return false;
+        provider = createWalletProvider(eip1193Provider);
       }
 
       const signer = await provider.getSigner();
       const contractAddress = contractForTicket(ticket);
       const contract = new ethers.Contract(contractAddress, CONTRACT_ABI, signer);
       if (!ethers.isAddress(toAddress) || toAddress === ethers.ZeroAddress) throw new Error("Enter a valid recipient address.");
+      if (toAddress.toLowerCase() === walletAddress.toLowerCase()) throw new Error('Enter a different recipient wallet.');
+      if ((await contract.ownerOf(ticketId)).toLowerCase() !== walletAddress.toLowerCase()) throw new Error('You no longer own this ticket. Refresh your wallet.');
       const live = await contract.getTicketDetails(ticketId);
       if (live.isUsed) throw new Error("A used ticket cannot be transferred.");
       if (await contract.paused()) throw new Error("Transfers are currently paused.");
       // Older deployments do not clear listings on standard NFT transfers.
       // Cancel first so a gift never inherits the previous owner's listing.
-      if (live.isForResale) await (await contract.cancelResaleListing(ticketId)).wait();
-      const tx = await contract.safeTransferFrom(walletAddress, toAddress, ticketId);
-      await tx.wait();
+      if (live.isForResale) await confirmTransaction(await sendContractTransaction(contract, "cancelResaleListing", [ticketId]));
+      const tx = await sendContractTransaction(contract, "safeTransferFrom", [walletAddress, toAddress, ticketId]);
+      await confirmTransaction(tx);
       addNotification("Ticket transferred!", "success");
       fetchDashboardData();
       return true;
     } catch (error) {
       console.error("Transfer failed:", error);
-      addNotification(error.reason || error.message || "Transaction failed", "error");
+      addNotification(transactionError(error), "error");
       return false;
-    }
+    } finally { ticketActionLock.current = false; setTicketActionBusy(false); }
   };
 
   // "My Tickets" = every token the connected wallet currently owns, EXCEPT an
@@ -879,7 +864,7 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
         )}
 
         {resaleTicket && (
-          <Modal key="resale" onClose={() => setResaleTicket(null)} icon={<Tag size={20} />} title="List for resale" subtitle="Anti-scalping cap applies">
+          <Modal key="resale" onClose={() => { if (!ticketActionBusy) setResaleTicket(null); }} icon={<Tag size={20} />} title="List for resale" subtitle="Anti-scalping cap applies">
             <p className="text-sm text-slate-600 leading-relaxed">
               To keep things fair, the price is capped at 110% of the original.
               Maximum: <span className="font-semibold text-slate-900">{rm(resaleMaxPrice)}</span> <span className="text-slate-400">({ethLabel(resaleMaxPrice)})</span>.
@@ -889,7 +874,8 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
               <label className="block text-sm font-medium text-slate-700 mb-1.5">Asking price (ETH)</label>
               <input
                 type="number"
-                step="0.001"
+                step="any"
+                min="0"
                 value={resalePriceInput}
                 onChange={(e) => setResalePriceInput(e.target.value)}
                 placeholder="0.00"
@@ -911,17 +897,17 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
               </button>
               <button
                 onClick={() => onListResale(resaleTicket, resalePriceInput).then(s => s && setResaleTicket(null))}
-                disabled={!resalePriceInput || priceExceeded || isPaused}
+                disabled={!resalePriceInput || priceExceeded || isPaused || ticketActionBusy}
                 className="flex-1 py-3 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-100 disabled:text-slate-400 text-white rounded-xl font-semibold text-sm transition-colors"
               >
-                List ticket
+                {ticketActionBusy ? "Confirming..." : "List ticket"}
               </button>
             </div>
           </Modal>
         )}
 
         {transferTicket && (
-          <Modal key="transfer" onClose={() => setTransferTicket(null)} icon={<Send size={20} />} title="Transfer ticket" subtitle="Send directly to another wallet">
+          <Modal key="transfer" onClose={() => { if (!ticketActionBusy) setTransferTicket(null); }} icon={<Send size={20} />} title="Transfer ticket" subtitle="Send directly to another wallet">
             <p className="text-sm text-slate-600 leading-relaxed">
               This sends the ticket to the address below. Transfers are final and can't be undone.
             </p>
@@ -944,7 +930,7 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
               </button>
               <button
                 onClick={() => onTransfer(transferTicket, recipientAddress).then(s => s && setTransferTicket(null))}
-                disabled={!recipientAddress || isPaused}
+                disabled={!recipientAddress || isPaused || ticketActionBusy}
                 className="flex-1 py-3 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-100 disabled:text-slate-400 text-white rounded-xl font-semibold text-sm transition-colors"
               >
                 Transfer

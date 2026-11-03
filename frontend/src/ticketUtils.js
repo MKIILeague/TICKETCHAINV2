@@ -2,6 +2,18 @@ import { ethers } from 'ethers';
 
 export const ticketKey = (ticket) => `${ticket.contractAddress.toLowerCase()}:${ticket.id}`;
 
+export function ticketIssuers(mintLogs) {
+  return new Map(mintLogs.map((log) => [String(log.args[0]), log.args[1].toLowerCase()]));
+}
+
+// Primary inventory is held by this token's original issuer. An organizer
+// who buys someone else's ticket is a normal buyer for that ticket.
+export function isPrimaryInventory(tokenId, owner, issuers) {
+  const issuer = issuers.get(String(tokenId));
+  if (!issuer) throw new Error(`Could not verify the issuer of ticket #${tokenId}. Refresh and try again.`);
+  return issuer === owner.toLowerCase();
+}
+
 // Replay transfers in chain order. Subtracting all outgoing IDs from incoming
 // IDs incorrectly hides a token that is subsequently transferred BACK to us.
 export function ownedTokenIds(incoming, outgoing, address) {

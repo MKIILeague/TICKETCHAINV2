@@ -15,6 +15,7 @@
     "test": "hardhat test",
     "contract:sync": "node scripts/syncAbi.js",
     "check": "npm test && npm --prefix frontend test && npm --prefix frontend run lint && npm --prefix frontend run build && npm --prefix backend test",
-    "check:live": "node scripts/checkPresentation.js"
+    "check:live": "node scripts/checkPresentation.js",
+    "check:transactions": "hardhat run scripts/rehearseSepolia.cjs"
   }
 }

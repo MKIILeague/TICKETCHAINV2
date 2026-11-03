@@ -1,9 +1,14 @@
 import { StrictMode, Component } from 'react'
 import { createRoot } from 'react-dom/client'
-import { PrivyProvider } from '@privy-io/react-auth'
+import { PrivyProvider, addRpcUrlOverrideToChain } from '@privy-io/react-auth'
 import { sepolia } from 'viem/chains'
 import './index.css'
 import App from './App.jsx'
+import { PUBLIC_RPC_URL } from './constants'
+
+// The SDK otherwise prioritizes its shared Sepolia RPC over viem's default URL.
+// Override it explicitly, including reads performed inside wallet confirmations.
+const ticketChain = addRpcUrlOverrideToChain(sepolia, PUBLIC_RPC_URL)
 
 // Privy only allows the `localhost` origin (not 127.0.0.1 / [::1]). Redirect
 // before React mounts so the embedded-wallet origin check doesn't 403.
@@ -64,8 +69,8 @@ createRoot(document.getElementById('root')).render(
           embeddedWallets: {
             ethereum: { createOnLogin: 'all-users' },
           },
-          defaultChain: sepolia,
-          supportedChains: [sepolia],
+          defaultChain: ticketChain,
+          supportedChains: [ticketChain],
           appearance: {
             theme: 'dark',
             accentColor: '#6366f1',

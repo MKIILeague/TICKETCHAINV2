@@ -1,3 +1,5 @@
+import { confirmTransaction, transactionError } from "./transactions";
+import { createWalletProvider } from "./chainAccess";
 import { cloneElement, useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { useNavigate, Navigate } from "react-router-dom";
 import { ethers } from "ethers";
@@ -286,7 +288,7 @@ const OrganizerDashboard = ({ walletAddress, wallet, connectWallet, logout, mode
         value: ethers.parseEther("10.0")
       });
 
-      await tx.wait();
+      await confirmTransaction(tx);
       alert("✅ Received 10.0 Localhost ETH! Your wallet is now funded.");
       fetchDashboardData();
     } catch (err) {
@@ -317,13 +319,13 @@ const OrganizerDashboard = ({ walletAddress, wallet, connectWallet, logout, mode
     setIsSendingEth(true);
     try {
       const eip1193Provider = await wallet.getEthereumProvider();
-      const provider = new ethers.BrowserProvider(eip1193Provider);
+      const provider = createWalletProvider(eip1193Provider);
       const signer = await provider.getSigner();
       const tx = await signer.sendTransaction({
         to: sendRecipient,
         value: ethers.parseEther(sendAmount.toString())
       });
-      await tx.wait();
+      await confirmTransaction(tx);
       alert("✅ ETH sent successfully!");
       setShowSendModal(false);
       setSendRecipient("");
@@ -331,7 +333,7 @@ const OrganizerDashboard = ({ walletAddress, wallet, connectWallet, logout, mode
       fetchDashboardData();
     } catch (error) {
       console.error("Send ETH failed:", error);
-      alert(error.reason || error.message || "Transaction failed");
+      alert(transactionError(error));
     } finally {
       setIsSendingEth(false);
     }
@@ -400,7 +402,7 @@ const OrganizerDashboard = ({ walletAddress, wallet, connectWallet, logout, mode
 
     // B) On-chain reads — wrapped so any failure here can't wipe the data above.
     try {
-      const walletProvider = new ethers.BrowserProvider(await wallet.getEthereumProvider());
+      const walletProvider = createWalletProvider(await wallet.getEthereumProvider());
       const walletChain = Number((await walletProvider.getNetwork()).chainId);
       // Sepolia-only in production; local Hardhat honoured only in dev. Also
       // stops a stray localhost wallet from showing a bogus ~10000-ETH balance.
@@ -597,7 +599,7 @@ const OrganizerDashboard = ({ walletAddress, wallet, connectWallet, logout, mode
     try {
       setWithdrawLoading(true);
       let eip1193Provider = await wallet.getEthereumProvider();
-      let provider = new ethers.BrowserProvider(eip1193Provider);
+      let provider = createWalletProvider(eip1193Provider);
 
       const network = await provider.getNetwork();
       const currentChainId = Number(network.chainId);
@@ -606,7 +608,7 @@ const OrganizerDashboard = ({ walletAddress, wallet, connectWallet, logout, mode
       if (currentChainId !== targetChainId) {
         await wallet.switchChain(targetChainId);
         eip1193Provider = await wallet.getEthereumProvider();
-        provider = new ethers.BrowserProvider(eip1193Provider);
+        provider = createWalletProvider(eip1193Provider);
       }
 
       const signer = await provider.getSigner();
@@ -638,12 +640,12 @@ const OrganizerDashboard = ({ walletAddress, wallet, connectWallet, logout, mode
       }
 
       const tx = await contract.withdrawOrganizerFunds();
-      await tx.wait();
+      await confirmTransaction(tx);
       alert("Funds withdrawn!");
       fetchDashboardData();
     } catch (error) {
       console.error("Withdrawal failed:", error);
-      alert(error.reason || error.message || "Transaction failed");
+      alert(transactionError(error));
     } finally {
       setWithdrawLoading(false);
     }

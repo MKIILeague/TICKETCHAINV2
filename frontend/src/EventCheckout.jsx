@@ -1,3 +1,5 @@
+import { confirmTransaction, transactionError, sendContractTransaction } from "./transactions";
+import { createWalletProvider } from "./chainAccess";
 import { useState, useEffect, useCallback } from "react";
 import { useParams, useNavigate, Link } from "react-router-dom";
 import { ethers } from "ethers";
@@ -12,7 +14,7 @@ import { EVENT_STATUS, effectiveStatus, isSaleBlocked } from "./eventStatus";
 import { ipfsToHttp } from "./ipfs";
 import { formatEventWindow } from "./dateFormat";
 
-import { queryTicketLogs } from "./ticketUtils";
+import { findPrimaryTickets } from "./primaryInventory";
 import { rm, ethLabel } from "./currency";
 
 /**
@@ -20,9 +22,8 @@ import { rm, ethLabel } from "./currency";
  *
  * The deployed contract sells the organiser's auto-listed primary tickets one at
  * a time via purchaseResaleTicket(ticketId), or atomically with batchPurchaseResale.
- * There is no buyer-facing batch-mint,
- * so buying N tickets = N purchaseResaleTicket calls (N wallet approvals) against
- * N distinct available token IDs. Inventory is tracked off-chain via the
+ * Newer deployments buy several existing tokens in one transaction; older
+ * deployments fall back to one purchase per token. Inventory is tracked via the
  * Firestore `sold` counter (aggregateSupply - sold = remaining).
  */
 export default function EventCheckout({ walletAddress, wallet, connectWallet }) {
@@ -63,47 +64,26 @@ export default function EventCheckout({ walletAddress, wallet, connectWallet }) 
   const qty = Math.min(Math.max(1, requestedQty), Math.max(1, remaining));
   const totalCost = price * qty;
   const exceedsStock = qty > remaining;
+  const ownEvent = !!walletAddress && walletAddress.toLowerCase() === ev?.organiserId?.toLowerCase();
 
   // The contract address the event was actually minted on (stored at publish).
   // Falls back to the active network's address for legacy/local events.
   const contractAddressFor = useCallback((chainId) => ev?.contractAddress || getContractAddress(chainId), [ev]);
 
-  // Find every listed, unused ticket for this event, cheapest first.
-  // Deliberately NOT filtered by organiser/ownership: any ticket that's listed
-  // for resale (primary face-value listing or a secondary listing) is buyable,
-  // which is far more robust across resales and redeploys.
+  // Only unsold stock owned by this event's issuer belongs in primary checkout.
   const findAvailableTickets = useCallback(async (provider, evt) => {
     const network = await provider.getNetwork();
     const chainId = Number(network.chainId);
     const contract = new ethers.Contract(contractAddressFor(chainId), CONTRACT_ABI, provider);
     const deployment = getDeployments(chainId).find((d) => d.address.toLowerCase() === contractAddressFor(chainId).toLowerCase());
     const startBlock = evt.mintBlock || deployment?.startBlock || 0;
-    const logs = await queryTicketLogs(contract, contract.filters.TicketMinted(null, evt.organiserId), startBlock);
-    const eventIds = evt.ticketIds ? new Set(evt.ticketIds.map(String)) : null;
-
-    const wantName = (evt.headline || "").trim();
-    const list = [];
-    for (const log of logs) {
-      if ((log.args[3] || "").trim() !== wantName) continue;
-      try {
-        const id = log.args[0];
-        if (eventIds && !eventIds.has(String(id))) continue;
-        const details = await contract.getTicketDetails(id);
-        if ((details.eventName || "").trim() !== wantName) continue;
-        if (!details.isForResale || details.isUsed) continue;
-        const owner = await contract.ownerOf(id);
-        if (owner.toLowerCase() !== evt.organiserId.toLowerCase()) continue;
-        if (owner.toLowerCase() === walletAddress?.toLowerCase()) continue;
-        list.push({ id: id.toString(), price: details.resalePrice });
-      } catch { /* skip unreadable token */ }
-    }
-    list.sort((a, b) => (a.price < b.price ? -1 : a.price > b.price ? 1 : 0));
-    return list;
-  }, [contractAddressFor, walletAddress]);
+    return findPrimaryTickets(contract, evt, { buyer: walletAddress, quantity: qty, startBlock });
+  }, [contractAddressFor, walletAddress, qty]);
 
   const handleBuy = async () => {
     if (phase === "buying") return;
     if (!wallet || !walletAddress) { connectWallet?.(); return; }
+    if (ownEvent) { setError("These are your organizer tickets. Sign in with a different buyer account to purchase them."); return; }
     if (blocked) { setError("This event is no longer on sale."); return; }
     if (remaining <= 0) { setError("This event is sold out."); return; }
     if (exceedsStock) { setError("Not enough tickets remaining."); return; }
@@ -114,7 +94,7 @@ export default function EventCheckout({ walletAddress, wallet, connectWallet }) 
     let purchased = 0;
 
     try {
-      let provider = new ethers.BrowserProvider(await wallet.getEthereumProvider());
+      let provider = createWalletProvider(await wallet.getEthereumProvider());
       const network = await provider.getNetwork();
       const currentChainId = Number(network.chainId);
       // Buy on the chain the event was published to (so we hit the right deployment).
@@ -125,7 +105,7 @@ export default function EventCheckout({ walletAddress, wallet, connectWallet }) 
           : 11155111;
       if (currentChainId !== targetChainId) {
         await wallet.switchChain(targetChainId);
-        provider = new ethers.BrowserProvider(await wallet.getEthereumProvider());
+        provider = createWalletProvider(await wallet.getEthereumProvider());
       }
 
       const available = await findAvailableTickets(provider, ev);
@@ -138,16 +118,6 @@ export default function EventCheckout({ walletAddress, wallet, connectWallet }) 
       }
       const picks = available.slice(0, qty);
 
-      // Demo mode: transactions execute with zero value, so we only need a gas buffer.
-      const gasBufferWei = ethers.parseEther((0.0005 * qty).toFixed(6));
-      const need = gasBufferWei; // Only require gas, not the ticket price
-      const balance = await provider.getBalance(walletAddress);
-      if (balance < need) {
-        setError(`Insufficient funds for gas. You need ~${parseFloat(ethers.formatEther(need)).toFixed(4)} ETH to cover network fees but have ${parseFloat(ethers.formatEther(balance)).toFixed(4)} ETH.`);
-        setPhase("idle");
-        return;
-      }
-
       const signer = await provider.getSigner();
       const contract = new ethers.Contract(contractAddressFor(targetChainId), CONTRACT_ABI, signer);
       const ids = picks.map((p) => p.id);
@@ -155,25 +125,24 @@ export default function EventCheckout({ walletAddress, wallet, connectWallet }) 
       // Prefer ONE combined transaction (batchPurchaseResale: mints/transfers all
       // requested tickets in a single block with the aggregate ETH value). Fall
       // back to per-ticket purchases only if the deployed contract predates it.
-      let batchSupported = true;
-      try {
-        await contract.batchPurchaseResale.staticCall(ids, { value: 0n });
-      } catch (probe) {
-        if (probe?.reason) throw probe;   // a real revert reason → surface it
-        batchSupported = false;           // function not present on this deployment
-      }
+      const code = await provider.getCode(contractAddressFor(targetChainId));
+      if (code === '0x') throw new Error('The ticket contract is missing on this network.');
+      const batchSupported = code.toLowerCase().includes(contract.interface.getFunction('batchPurchaseResale').selector.slice(2).toLowerCase());
+      // A network error or a real batch revert must not trigger additional
+      // individual purchases. Only older bytecode without this method falls back.
+      if (batchSupported) await contract.batchPurchaseResale.staticCall(ids, { value: 0n });
 
       if (batchSupported) {
         setProgress({ current: 0, total: qty });
-        const tx = await contract.batchPurchaseResale(ids, { value: 0n });
-        await tx.wait();
+        const tx = await sendContractTransaction(contract, "batchPurchaseResale", [ids]);
+        await confirmTransaction(tx);
         purchased = ids.length;
       } else {
         // Legacy fallback: one approval per ticket.
         for (let i = 0; i < picks.length; i++) {
           setProgress({ current: i + 1, total: qty });
-          const tx = await contract.purchaseResaleTicket(picks[i].id, { value: 0n });
-          await tx.wait();
+          const tx = await sendContractTransaction(contract, "purchaseResaleTicket", [picks[i].id]);
+          await confirmTransaction(tx);
           purchased++;
         }
       }
@@ -191,7 +160,7 @@ export default function EventCheckout({ walletAddress, wallet, connectWallet }) 
       navigate("/wallet", { state: { purchased, eventTitle: ev.headline, syncWarning } });
     } catch (err) {
       console.error("Purchase failed:", err);
-      const reason = err?.reason || err?.data?.message || err?.message || "Transaction failed";
+      const reason = transactionError(err);
 
       // Persist whatever succeeded before the failure so inventory stays accurate.
       if (purchased > 0) {
@@ -306,6 +275,7 @@ export default function EventCheckout({ walletAddress, wallet, connectWallet }) 
               </div>
 
               {/* quantity counter */}
+              <p className="text-xs text-slate-500">Demo payment: ticket prices are simulated. Your wallet pays only Sepolia network gas.</p>
               <div className="flex items-center justify-between">
                 <span className="text-sm font-medium text-slate-700">Quantity</span>
                 <div className="inline-flex items-center rounded-xl border border-slate-200 bg-white overflow-hidden">
@@ -364,14 +334,17 @@ export default function EventCheckout({ walletAddress, wallet, connectWallet }) 
               ) : (
                 <button
                   onClick={handleBuy}
-                  disabled={buying || remaining <= 0 || exceedsStock}
+                  disabled={buying || remaining <= 0 || exceedsStock || ownEvent}
                   className="w-full py-3.5 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-200 disabled:text-slate-400 text-white rounded-xl font-semibold text-sm transition-colors inline-flex items-center justify-center gap-2"
                 >
                   {buying ? <><RefreshCw size={16} className="animate-spin" /> Processing…</>
+                    : ownEvent ? "Your organizer inventory"
                     : remaining <= 0 ? "Sold out"
                     : <><Ticket size={16} /> Confirm purchase · {rm(totalCost)}</>}
                 </button>
               )}
+
+              {ownEvent && <p className="text-sm text-slate-600">You own these unsold tickets. Use a different buyer account to test purchasing.</p>}
 
               {error && (
                 <div className="flex items-start gap-2 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">

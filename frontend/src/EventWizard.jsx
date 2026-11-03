@@ -1,3 +1,4 @@
+import { createWalletProvider } from "./chainAccess";
 import { useState, useEffect, useRef, useCallback } from "react";
 import { ethers } from "ethers";
 import {
@@ -264,10 +265,10 @@ export default function EventWizard({ wallet, walletAddress, orgData, isPaused, 
       const controller = new AbortController();
       mintController.current = controller;
       setStopping(false);
-      let provider = new ethers.BrowserProvider(await wallet.getEthereumProvider());
+      let provider = createWalletProvider(await wallet.getEthereumProvider());
       if (Number((await provider.getNetwork()).chainId) !== record.request.chainId) {
         await wallet.switchChain(record.request.chainId);
-        provider = new ethers.BrowserProvider(await wallet.getEthereumProvider());
+        provider = createWalletProvider(await wallet.getEthereumProvider());
       }
       const signer = await provider.getSigner();
       const contract = new ethers.Contract(record.request.contractAddress, CONTRACT_ABI, signer);
@@ -345,7 +346,7 @@ export default function EventWizard({ wallet, walletAddress, orgData, isPaused, 
           { trait_type: "Event date", value: timestamp, display_type: "date" },
         ],
       }, form.headline.trim() + " metadata");
-      const provider = new ethers.BrowserProvider(await wallet.getEthereumProvider());
+      const provider = createWalletProvider(await wallet.getEthereumProvider());
       const currentChain = Number((await provider.getNetwork()).chainId);
       const chainId = import.meta.env.DEV && currentChain === 31337 ? 31337 : 11155111;
       const contractAddress = getContractAddress(chainId);

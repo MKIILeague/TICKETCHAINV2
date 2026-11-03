@@ -1,3 +1,5 @@
+import { confirmTransaction, transactionError, sendContractTransaction } from "./transactions";
+import { createWalletProvider } from "./chainAccess";
 import { useState, useRef } from "react";
 import { ethers } from "ethers";
 import {
@@ -40,13 +42,13 @@ const GatekeeperTerminal = ({ walletAddress, wallet, connectWallet }) => {
     scanLock.current = true;
     setLoading(true); setScanStatus("IDLE"); setScanError(""); setTicketDetails(null);
     try {
-      let provider = new ethers.BrowserProvider(await wallet.getEthereumProvider());
+      let provider = createWalletProvider(await wallet.getEthereumProvider());
       const currentChainId = Number((await provider.getNetwork()).chainId);
       const targetChainId = packet?.chainId || (import.meta.env.DEV && currentChainId === 31337 ? 31337 : 11155111);
       if (targetChainId === 31337 && !import.meta.env.DEV) throw new Error("Local tickets require the local development app.");
       if (currentChainId !== targetChainId) {
         await wallet.switchChain(targetChainId);
-        provider = new ethers.BrowserProvider(await wallet.getEthereumProvider());
+        provider = createWalletProvider(await wallet.getEthereumProvider());
       }
       setNetLabel(targetChainId === 31337 ? "Localhost" : "Sepolia");
       const contractAddress = packet?.contract || getContractAddress(targetChainId);
@@ -62,7 +64,7 @@ const GatekeeperTerminal = ({ walletAddress, wallet, connectWallet }) => {
     } catch (error) {
       console.error("Scan failed:", error);
       setScanStatus("INVALID"); setTicketDetails(null);
-      setScanError(error.reason || error.shortMessage || error.message || "Unable to verify the ticket.");
+      setScanError(transactionError(error));
       setStats((v) => ({ ...v, scanned: v.scanned + 1, denied: v.denied + 1 }));
     } finally { scanLock.current = false; setLoading(false); }
   };
@@ -74,19 +76,19 @@ const GatekeeperTerminal = ({ walletAddress, wallet, connectWallet }) => {
       const evStatus = await fetchEventStatusByName(ticketDetails.eventName, { strict: true });
       if (isSaleBlocked(evStatus)) { setEventStatus(evStatus); setScanStatus("EVENT_BLOCKED"); return; }
       await wallet.switchChain(ticketDetails.chainId);
-      const provider = new ethers.BrowserProvider(await wallet.getEthereumProvider());
+      const provider = createWalletProvider(await wallet.getEthereumProvider());
       const signer = await provider.getSigner();
       const contract = new ethers.Contract(ticketDetails.contractAddress, CONTRACT_ABI, signer);
       const [live, owner] = await Promise.all([contract.getTicketDetails(ticketDetails.id), contract.ownerOf(ticketDetails.id)]);
       if (live.isUsed) { setScanStatus("CONSUMED"); setTicketDetails({ ...ticketDetails, isUsed: true }); return; }
       if (owner.toLowerCase() !== ticketDetails.owner.toLowerCase()) throw new Error("Ownership changed since scanning. Scan the new owner's QR.");
-      const tx = await contract.useTicket(ticketDetails.id);
-      await tx.wait();
+      const tx = await sendContractTransaction(contract, "useTicket", [ticketDetails.id]);
+      await confirmTransaction(tx);
       setScanStatus("CONSUMED"); setTicketDetails({ ...ticketDetails, isUsed: true });
       setStats((v) => ({ ...v, admitted: v.admitted + 1 }));
     } catch (error) {
       console.error("Check-in failed:", error);
-      setScanError(error.reason || error.shortMessage || error.message || "Check-in failed. Try again.");
+      setScanError(transactionError(error));
     } finally { admissionLock.current = false; setAdmitting(false); }
   };
 

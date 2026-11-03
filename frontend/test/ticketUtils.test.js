@@ -1,11 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { ownedTokenIds, ticketKey, parseTicketQr, queryTicketLogs } from '../src/ticketUtils.js';
+import { ownedTokenIds, ticketKey, parseTicketQr, queryTicketLogs, ticketIssuers, isPrimaryInventory } from '../src/ticketUtils.js';
 import { withTimeout } from '../src/asyncUtils.js';
 
 const alice = '0x1111111111111111111111111111111111111111';
 const bob = '0x2222222222222222222222222222222222222222';
 const contract = '0x3333333333333333333333333333333333333333';
+test('primary stock belongs to its original issuer, even if a later seller is an organizer', () => {
+  const issuers = ticketIssuers([{ args: [1n, alice] }, { args: [2n, bob] }]);
+  assert.equal(isPrimaryInventory(1, alice, issuers), true);
+  assert.equal(isPrimaryInventory(1, bob, issuers), false);
+  assert.equal(isPrimaryInventory(2, bob, issuers), true);
+  assert.throws(() => isPrimaryInventory(3, bob, issuers), /Could not verify the issuer/);
+});
 const log = (from, to, block, id = 1n, index = 0) => ({
   args: [from, to, id], blockNumber: block, index, transactionHash: `tx${block}`,
 });
