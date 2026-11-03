@@ -2,7 +2,7 @@
 
 ## Current result
 
-Local source checks pass: 21 Solidity tests, 14 frontend logic tests, 9 backend
+Local source checks pass: 28 contract/mint-integration tests, 22 frontend logic tests, 9 backend
 authentication tests, ESLint and the production/PWA build. The frontend serves at
 http://localhost:5173, and the optional backend health check responds at port 5000.
 The protected backend profile rejects requests without an access token.
@@ -11,10 +11,14 @@ Read-only live checks confirm that Pinata authentication and Privy's JWKS endpoi
 respond. The configured Sepolia deployment exists, is unpaused, has 500 minted
 tickets, and is owned by `0x6eE97e0DFdaf29f365Fa82e26B63388f5748f707`.
 
-**The app is not yet verified end to end for the presentation.** Firestore rejected
-requests with `permission-denied` during the final service check. The supplied
-rules expired on 21 September 2026. No live database rules were changed, no public
-contract was deployed, and no NFT transactions or uploads were submitted.
+**Firestore reads are restored after the user updated the rules.** The new live
+check retrieved 11 published events, but none have an upcoming date. Publish a
+small future-dated event before rehearsing the storefront and checkout. The initial
+permission error came from rules that expired on 21 September 2026.
+
+**The app is not yet verified end to end for the presentation.** The agent did not
+change live database rules, deploy a public contract, or submit NFT transactions
+or uploads. The user reports that the website account access now works.
 
 Browser automation stopped because its safety check could not reliably determine
 the current browser URL. Visual checks, Privy sign-in, actual event publication,
@@ -40,14 +44,43 @@ purchase/resale transactions and camera scans still require a manual rehearsal.
 - Primary checkout uses the issuing organizer's remaining stock, with mint block
   and token IDs recorded for newly published events. A confirmed purchase stays
   successful even if its database inventory-counter update fails.
-- Publication retains a confirmed mint for retry if the database write fails,
-  avoiding a second mint during a normal retry. Recovery is stored in the same
-  browser; if local storage is unavailable, keep the page open to retry.
+- Event publication uses live gas estimates to split large supplies into capped
+  transactions. It checkpoints each batch and its hash, verifies receipts, and
+  resumes from confirmed IDs after cancellation or connection loss. Recovery is
+  stored in the same browser; storage must be writable before another batch is sent.
 - Admin actions check network, contract presence and actual on-chain ownership.
 - Corrected backend JWT verification to ES256, matching
   [Privy's access-token specification](https://docs.privy.io/authentication/user-authentication/access-tokens).
 - Fixed lint errors and unstable component definitions, and corrected stale
   deployment addresses in helper scripts. Local-only setup scripts reject Sepolia.
+
+## Online event-creation failure and repair
+
+The user's [150-ticket mint transaction](https://sepolia.etherscan.io/tx/0x96f156414080b4d8cfaae899a34f9e067eeec3b54229a72830a12f2737da9df3)
+for `SUBANG RUN FESTIVAL` failed with receipt status 0. It requested 22,700,000 gas
+and consumed 16,777,216. The organizer was whitelisted, the contract was unpaused,
+and the organizer had about 1.47 Sepolia ETH. Read-only replay returned out of gas.
+The old fallback guessed 150,000 gas per ticket after estimation failed, while a
+current live estimate for one ticket was about 1,060,473 gas.
+
+`mintBatches.js` now estimates one ticket and each candidate batch, includes a 20%
+buffer, and keeps the requested limit under the block budget and the
+[EIP-7825 transaction cap](https://eips.ethereum.org/EIPS/eip-7825). It never submits
+a guessed gas limit when the RPC fails. Read-only validation on the existing
+deployment planned 13 tickets with a 15,831,358 gas limit, roughly 12 confirmations
+for this 150-ticket event. Every subsequent batch is estimated afresh.
+
+Only fully minted inventory becomes published in Firestore. `Resume publication`
+reconciles a pending transaction before sending more; saved IDs prevent reminting
+confirmed batches. A wallet submission interrupted before its hash was saved
+requires the user to supply that hash, which is checked against the wallet,
+contract, event, metadata, price, quantity and nonce. A preparation with no submitted
+or confirmed mint can be discarded to edit the draft. Legacy sync-only recovery
+records remain supported.
+
+This repair is frontend-only and works with the existing deployed contract. It
+must be committed and deployed to the hosted frontend before it changes the live
+website. No public mint transactions were submitted by the agent during testing.
 
 ## Updated contract versus existing Sepolia contracts
 
@@ -78,7 +111,7 @@ configuration for `events`, `organisers`, `staff`, and `profiles`. It permits re
 and writes until **5 November 2026 at 00:00 UTC / 08:00 Malaysia time**. Anyone with
 the public project configuration can read/change these records until expiry.
 Apply it only to disposable demo data, through Firebase Console → Firestore
-Database → Rules → Publish. It has not been deployed automatically and is not
+Database → Rules → Publish. It was not deployed by the agent and is not
 referenced by `firebase.json`. Set a suitable short expiry if rehearsing later.
 
 A permanent setup should verify the Privy token on a trusted backend, issue a

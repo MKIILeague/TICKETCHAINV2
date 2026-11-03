@@ -16,6 +16,8 @@ import { rm, ethLabel } from "./currency";
 
 import { readPendingPublish, savePendingPublish, clearPendingPublish } from "./publishRecovery";
 
+import { mintEventBatches } from "./mintBatches";
+
 const CATEGORIES = ["Concert", "Sports", "Theatre", "Conference"];
 
 const EMPTY = { headline: "", dateTime: "", category: "", venue: "", description: "", totalSupply: "", price: "" };
@@ -25,6 +27,17 @@ const STEPS = [
   { key: "chain", label: "Minting on-chain" },
   { key: "sync", label: "Publishing event" },
 ];
+
+function MintProgress({ progress }) {
+  if (!progress) return null;
+  return (
+    <div className="space-y-2 text-sm" aria-live="polite">
+      <p className="font-semibold">{progress.minted} / {progress.total} tickets confirmed</p>
+      <progress aria-label="Tickets minted" value={progress.minted} max={progress.total} className="h-2 w-full accent-indigo-600" />
+      {progress.batchQuantity > 0 && <p>Next wallet confirmation: {progress.batchQuantity} tickets. Wait for its receipt before continuing.</p>}
+    </div>
+  );
+}
 
 // UNIX seconds -> value for <input type="datetime-local"> in local time.
 function unixToLocalInput(unixSec) {
@@ -47,6 +60,12 @@ function formatEventDate(unixSec) {
 export default function EventWizard({ wallet, walletAddress, orgData, isPaused, onPublished }) {
   const [pendingPublish, setPendingPublish] = useState(() => readPendingPublish(walletAddress));
   const pendingForWallet = pendingPublish?.walletAddress === walletAddress ? pendingPublish : null;
+  const publishLock = useRef(false);
+  const recoveryRef = useRef(pendingPublish);
+  const mintController = useRef(null);
+  useEffect(() => () => mintController.current?.abort(), [walletAddress]);
+  const [mintProgress, setMintProgress] = useState(null);
+  const [recoveryHash, setRecoveryHash] = useState("");
   const [view, setView] = useState("list"); // list | edit | preview
   const [events, setEvents] = useState([]);
   const [loadingList, setLoadingList] = useState(false);
@@ -113,6 +132,7 @@ export default function EventWizard({ wallet, walletAddress, orgData, isPaused, 
   const newEvent = () => { resetForm(); setView("edit"); };
 
   const editEvent = (ev) => {
+    if (pendingForWallet?.id === ev.id) { setError("Resume this event below, or discard its preparation before editing."); return; }
     setForm({
       headline: ev.headline || "",
       dateTime: unixToLocalInput(ev.timestamp),
@@ -224,170 +244,114 @@ export default function EventWizard({ wallet, walletAddress, orgData, isPaused, 
   };
 
   // ── Publish (the heavy web3 pipeline) ──
-  const recoverPublish = async () => {
-    if (!pendingForWallet || busy) return;
-    setPhase("sync"); setError("");
-    try {
-      await updateDoc(doc(db, "events", pendingForWallet.id), pendingForWallet.payload);
-      try { clearPendingPublish(walletAddress); } catch { /* storage may be unavailable */ }
-      setPendingPublish(null);
-      await loadEvents(); onPublished?.();
-      resetForm(); setView("list"); setPhase("idle");
-    } catch (error) {
-      setPhase("error");
-      setError("Tickets are already minted. Database publication is still pending: " + error.message);
+  const checkpointMint = (record) => {
+    recoveryRef.current = record;
+    setPendingPublish(record);
+    savePendingPublish(record.walletAddress, record);
+  };
+
+  const finishPublication = async (record) => {
+    if (record.request && record.stage !== "sync") {
+      if (!wallet || !walletAddress) throw new Error("Sign into the original organizer account to resume.");
+      setPhase("chain");
+      const controller = new AbortController();
+      mintController.current = controller;
+      let provider = new ethers.BrowserProvider(await wallet.getEthereumProvider());
+      if (Number((await provider.getNetwork()).chainId) !== record.request.chainId) {
+        await wallet.switchChain(record.request.chainId);
+        provider = new ethers.BrowserProvider(await wallet.getEthereumProvider());
+      }
+      const signer = await provider.getSigner();
+      const contract = new ethers.Contract(record.request.contractAddress, CONTRACT_ABI, signer);
+      record = await mintEventBatches({ contract, record, save: checkpointMint, onProgress: setMintProgress, signal: controller.signal });
     }
+    setPhase("sync");
+    await updateDoc(doc(db, "events", record.id), record.payload);
+    setEvents((previous) => previous.map((event) => event.id === record.id ? { ...event, ...record.payload } : event));
+    // A leftover sync-only record is safe to retry: it cannot mint more tickets.
+    try { clearPendingPublish(walletAddress); } catch (error) { console.warn("Could not clear recovery storage:", error); }
+    recoveryRef.current = null; setPendingPublish(null); setRecoveryHash("");
+    onPublished?.(); await loadEvents();
+    resetForm(); setView("list"); setPhase("done");
+  };
+
+  const showPublishError = (error) => {
+    console.error("Publish failed:", error);
+    setPhase("error");
+    const record = recoveryRef.current;
+    const reason = error.code === "ACTION_REJECTED" ? "You cancelled the wallet confirmation."
+      : error.reason || error.info?.error?.message || error.shortMessage || error.message || "Publication failed.";
+    setError(record?.request
+      ? reason + " " + record.ticketIds.length + "/" + record.request.quantity + " tickets are confirmed. Resume below to mint only the remainder."
+      : record ? "Tickets are already minted. Retry database publication below. " + reason : reason);
+    if (record) setView("list");
+  };
+
+  const recoverPublish = async () => {
+    if (!pendingForWallet || busy || publishLock.current) return;
+    publishLock.current = true; setError("");
+    try {
+      let record = pendingForWallet;
+      if (record.request && (record.submitting || record.pendingHash) && recoveryHash.trim()) {
+        const hash = recoveryHash.trim();
+        if (!ethers.isHexString(hash, 32)) throw new Error("Paste a complete transaction hash (0x followed by 64 hex characters).");
+        record = { ...record, pendingHash: hash, submitting: false };
+        checkpointMint(record);
+      }
+      await finishPublication(record);
+    } catch (error) { showPublishError(error); }
+    finally { publishLock.current = false; }
+  };
+
+  const discardPreparation = () => {
+    if (busy || pendingForWallet?.ticketIds?.length || pendingForWallet?.pendingHash || pendingForWallet?.submitting) return;
+    clearPendingPublish(walletAddress); recoveryRef.current = null; setPendingPublish(null);
+    setMintProgress(null); setError(""); setPhase("idle");
   };
 
   const handlePublish = async () => {
-    if (busy) return;
+    if (busy || publishLock.current) return;
     if (pendingForWallet) { await recoverPublish(); return; }
-    const v = validateFull();
-    if (v) { setError(v); return; }
+    const validation = validateFull();
+    if (validation) { setError(validation); return; }
     if (!wallet || !walletAddress) { setError("Connect your wallet first."); return; }
-
-    const quantity = parseInt(form.totalSupply, 10);
-    const ts = Math.floor(new Date(form.dateTime).getTime() / 1000);
-    let diagChainId = null, diagContract = null;
-    let confirmedMint = null;
-
+    publishLock.current = true;
     try {
-      // ── Step A — IPFS payload (pin poster if needed, then metadata) ─────────
-      setPhase("ipfs");
-      setError("");
-      const { id, imageHash } = await persistDraft(); // ensures doc id + pinned poster
-      const metadata = {
-        name: form.headline.trim(),
-        description: form.description.trim(),
-        image: `ipfs://${imageHash}`,
+      setPhase("ipfs"); setError(""); setMintProgress(null);
+      const { id, imageHash } = await persistDraft();
+      const timestamp = Math.floor(new Date(form.dateTime).getTime() / 1000);
+      const quantity = Number(form.totalSupply);
+      const metadataCid = await uploadJSONToIPFS({
+        name: form.headline.trim(), description: form.description.trim(), image: "ipfs://" + imageHash,
         attributes: [
           { trait_type: "Category", value: form.category },
           { trait_type: "Venue", value: form.venue.trim() },
-          { trait_type: "Event date", value: ts, display_type: "date" },
+          { trait_type: "Event date", value: timestamp, display_type: "date" },
         ],
+      }, form.headline.trim() + " metadata");
+      const provider = new ethers.BrowserProvider(await wallet.getEthereumProvider());
+      const currentChain = Number((await provider.getNetwork()).chainId);
+      const chainId = import.meta.env.DEV && currentChain === 31337 ? 31337 : 11155111;
+      const contractAddress = getContractAddress(chainId);
+      const record = {
+        version: 2, walletAddress, id, stage: "minting", ticketIds: [], mintTransactions: [],
+        firstMintBlock: null, pendingHash: null, submitting: false, batchQuantity: null,
+        request: { contractAddress, chainId, quantity, tokenURI: "ipfs://" + metadataCid,
+          priceWei: ethers.parseEther(form.price).toString(), eventName: form.headline.trim() },
+        payload: { status: "published", ipfsHash: metadataCid, contractAddress, chainId, timestamp,
+          aggregateSupply: quantity, priceEth: form.price,
+          publishedAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
       };
-      const metadataCid = await uploadJSONToIPFS(metadata, `${form.headline.trim()} — metadata`);
-      const tokenURI = `ipfs://${metadataCid}`;
-
-      // ── Step B — Blockchain minting ─────────────────────────────────────────
-      setPhase("chain");
-      let eip1193Provider = await wallet.getEthereumProvider();
-      let provider = new ethers.BrowserProvider(eip1193Provider);
-
-      const network = await provider.getNetwork();
-      const currentChainId = Number(network.chainId);
-      const targetChainId = (currentChainId === 31337 || currentChainId === 11155111) ? currentChainId : 11155111;
-      if (currentChainId !== targetChainId) {
-        await wallet.switchChain(targetChainId);
-        eip1193Provider = await wallet.getEthereumProvider();
-        provider = new ethers.BrowserProvider(eip1193Provider);
-      }
-
-      try {
-        const bal = await provider.getBalance(walletAddress);
-        if (parseFloat(ethers.formatEther(bal)) < 0.0005) {
-          const proceed = window.confirm("⚠️ Low balance\n\nYour wallet has very little ETH, which may not cover gas. Continue anyway?");
-          if (!proceed) { setPhase("idle"); return; }
-        }
-      } catch { /* best-effort */ }
-
-      const signer = await provider.getSigner();
-      const contractAddress = getContractAddress(targetChainId);
-      diagChainId = targetChainId; diagContract = contractAddress;
-      const contract = new ethers.Contract(contractAddress, CONTRACT_ABI, signer);
-      const priceInWei = ethers.parseEther(String(form.price)); // permanent face value (110% resale ceiling)
-
-      try {
-        await contract.batchMintTickets.staticCall(walletAddress, tokenURI, priceInWei, form.headline.trim(), quantity);
-      } catch (pf) {
-        console.warn("[publish] mint preflight (non-blocking):", pf?.reason || pf?.shortMessage || pf?.message);
-        if (pf?.reason?.includes("Not a whitelisted organizer") || pf?.message?.includes("Not a whitelisted organizer")) {
-          alert("❌ Your wallet is not yet whitelisted on the smart contract.\n\nPlease wait for an admin to approve and whitelist your wallet address.");
-          setPhase("idle");
-          return;
-        }
-      }
-
-      let gasLimit;
-      try {
-        const est = await contract.batchMintTickets.estimateGas(walletAddress, tokenURI, priceInWei, form.headline.trim(), quantity);
-        gasLimit = (est * 120n) / 100n; // 20% buffer
-      } catch (err) {
-        console.warn("[publish] gas estimation failed, using fallback:", err);
-        gasLimit = 200000n + 150000n * BigInt(quantity);
-      }
-
-      if (gasLimit > 29000000n) {
-        alert("❌ Too many tickets for a single transaction! The network gas limit would be exceeded.\n\nPlease deploy your event with a smaller total ticket quantity (e.g. max 100-150 tickets at a time).");
-        setPhase("idle");
-        return;
-      }
-
-      const tx = await contract.batchMintTickets(walletAddress, tokenURI, priceInWei, form.headline.trim(), quantity, { gasLimit });
-      const receipt = await tx.wait();
-
-      // ── Step C — Firestore mutation: draft → published ──────────────────────
-      setPhase("sync");
-      const publishPayload = {
-        status: "published",
-        mintBlock: receipt.blockNumber,
-        ticketIds: receipt.logs.flatMap((log) => {
-          try { const event = contract.interface.parseLog(log); return event?.name === "TicketMinted" ? [event.args[0].toString()] : []; }
-          catch { return []; }
-        }),
-        ipfsHash: metadataCid,
-        contractAddress,
-        txHash: receipt?.hash || tx.hash,
-        chainId: targetChainId,
-        timestamp: ts,
-        aggregateSupply: quantity,
-        priceEth: form.price,
-        publishedAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      };
-      confirmedMint = { walletAddress, id, payload: publishPayload };
-      setPendingPublish(confirmedMint);
-      try { savePendingPublish(walletAddress, confirmedMint); } catch (error) { console.warn("Could not persist publish recovery:", error); }
-      await updateDoc(doc(db, "events", id), publishPayload);
-      try { clearPendingPublish(walletAddress); } catch { /* storage may be unavailable */ }
-      setPendingPublish(null);
-
-      setPhase("done");
-      onPublished?.();
-      await loadEvents();
-      alert(`✅ Published "${form.headline.trim()}" — minted ${quantity} ticket(s).\nMetadata CID: ${metadataCid}`);
-      resetForm();
-      setView("list");
-      setTimeout(() => setPhase("idle"), 1200);
-    } catch (err) {
-      console.error("Publish failed:", err);
-      setPhase("error");
-      if (confirmedMint) {
-        setError("The mint is confirmed, but publication did not finish. Retry database publication below; do not mint again.");
-        setView("list");
-        return;
-      }
-      const reason = err?.reason || err?.data?.message || err?.message || "Unknown error";
-      if (err?.code === "ACTION_REJECTED" || /rejected|denied/i.test(reason)) {
-        setError("You cancelled the transaction. The event is still a draft.");
-      } else if (/not whitelisted|organizer|caller/i.test(reason)) {
-        setError(`Your wallet isn't whitelisted as an organizer on this contract. Ask the admin to whitelist: ${walletAddress}`);
-      } else if (/missing revert data|CALL_EXCEPTION|no matching/i.test(reason)) {
-        const net = diagChainId === 31337 ? "Localhost 31337" : diagChainId === 11155111 ? "Sepolia" : `chain ${diagChainId}`;
-        setError(`The contract rejected the mint (no reason returned). Most likely your wallet isn't whitelisted on ${net} (${diagContract}).`);
-      } else if (/insufficient funds/i.test(reason)) {
-        setError("Not enough ETH to cover gas. Fund your wallet and try again.");
-      } else if (/Pinata|IPFS/i.test(reason)) {
-        setError(`IPFS upload failed: ${reason}`);
-      } else {
-        setError(reason);
-      }
-    }
+      // Retain the exact metadata and request before opening the first wallet
+      // prompt. Resuming never repeats completed batches or re-uploads metadata.
+      checkpointMint(record);
+      await finishPublication(record);
+    } catch (error) { showPublishError(error); }
+    finally { publishLock.current = false; }
   };
 
-  // Soft-delete a draft or canceled event: flip status to "deleted"
-  // (kept in Firestore for audit, hidden from every dashboard).
   const handleDelete = async (ev) => {
+    if (pendingForWallet?.id === ev.id) { setError("Finish or discard the pending publication before deleting this draft."); return; }
     if (!window.confirm(`Delete "${ev.headline || "Untitled"}"? It will be removed from your dashboards (kept in our records for audit).`)) return;
     try {
       await softDeleteEvent(ev.id);
@@ -425,9 +389,23 @@ export default function EventWizard({ wallet, walletAddress, orgData, isPaused, 
     return (
       <div className="max-w-5xl space-y-8">
         {pendingForWallet && (
-          <div role="alert" className="rounded-xl border border-amber-200 bg-amber-50 p-5 text-sm text-amber-900">
-            <p>Tickets have already been minted. Finish publishing this event without minting again.</p>
-            <button disabled={busy} onClick={recoverPublish} className="mt-3 rounded-lg bg-amber-700 px-4 py-2 text-white disabled:opacity-40">Retry publication</button>
+          <div role="status" className="rounded-xl border border-amber-200 bg-amber-50 p-5 text-sm text-amber-900 space-y-3">
+            <p>{pendingForWallet.request
+              ? "Publication in progress: " + pendingForWallet.request.eventName + ". Confirmed batches are saved."
+              : "Tickets have already been minted. Finish database publication without minting again."}</p>
+            {pendingForWallet.request && <MintProgress progress={mintProgress || { minted: pendingForWallet.ticketIds.length, total: pendingForWallet.request.quantity }} />}
+            {pendingForWallet.pendingHash && <a href={"https://sepolia.etherscan.io/tx/" + pendingForWallet.pendingHash} target="_blank" rel="noreferrer" className="block underline">View the pending transaction</a>}
+            {(pendingForWallet.submitting || pendingForWallet.pendingHash) && !busy && (
+              <label className="block">If the wallet submission was interrupted, paste or correct its transaction hash to check it safely:
+                <input aria-label="Interrupted mint transaction hash" value={recoveryHash} onChange={(e) => setRecoveryHash(e.target.value)} placeholder="0x..." className="mt-2 w-full rounded-lg border border-amber-300 bg-white p-2 font-mono text-xs" />
+              </label>
+            )}
+            <div className="flex flex-wrap gap-2">
+              <button disabled={busy} onClick={recoverPublish} className="rounded-lg bg-amber-700 px-4 py-2 text-white disabled:opacity-40">{busy ? "Publishing..." : "Resume publication"}</button>
+              {pendingForWallet.request && !pendingForWallet.ticketIds.length && !pendingForWallet.pendingHash && !pendingForWallet.submitting && (
+                <button disabled={busy} onClick={discardPreparation} className="rounded-lg border border-amber-400 px-4 py-2 disabled:opacity-40">Discard preparation</button>
+              )}
+            </div>
           </div>
         )}
         {error && <p role="alert" className="text-sm text-red-600">{error}</p>}
@@ -655,6 +633,7 @@ export default function EventWizard({ wallet, walletAddress, orgData, isPaused, 
           </div>
         )}
 
+        {phase === "chain" && <MintProgress progress={mintProgress} />}
         {(busy || phase === "done") && (
           <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 space-y-2.5">
             {STEPS.map((s, i) => {
@@ -754,12 +733,13 @@ export default function EventWizard({ wallet, walletAddress, orgData, isPaused, 
             <div>
               <label className={labelCls}><Hash size={15} className="text-indigo-600" /> Total quantity *</label>
               <input type="number" min="1" step="1" value={form.totalSupply} onChange={set("totalSupply")} disabled={busy} placeholder="500" className={inputCls} />
+              <p className="mt-1.5 text-xs text-slate-500">Large events use several safe batches. Confirm each batch in your wallet; progress is saved for resuming.</p>
             </div>
             <div>
               <label className={labelCls}><DollarSign size={15} className="text-indigo-600" /> Ticket price (ETH) *</label>
               <input type="number" min="0" step="any" value={form.price} onChange={set("price")} disabled={busy} placeholder="0.05" className={inputCls} />
               {parseFloat(form.price) > 0 && (
-                <p className="mt-1.5 text-xs text-slate-500">Buyers see <span className="font-semibold text-slate-700">{rm(form.price)}</span> · settled on-chain in ETH</p>
+                <p className="mt-1.5 text-xs text-slate-500">Buyers see <span className="font-semibold text-slate-700">{rm(form.price)}</span> · simulated ticket price</p>
               )}
             </div>
           </div>

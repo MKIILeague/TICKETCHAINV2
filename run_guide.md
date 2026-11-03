@@ -42,8 +42,9 @@ npm run check:live
 It checks Pinata credentials, Privy verification keys, the current Sepolia contract
 and published future events in Firestore. It does not upload, deploy or sign.
 
-The supplied Firestore rules expired on **21 September 2026**. Until rules are
-restored, applications/events/profiles/staff cannot work. See
+The original Firestore rules expired on **21 September 2026**. The user has since
+restored access; the live read check retrieved 11 published events, all past-dated.
+Publish a future-dated event before rehearsing the storefront. See
 [the status report](docs/PRESENTATION_STATUS.md#firestore-recovery) and the optional
 [short-lived demo rules](docs/firestore-demo.rules). Those rules permit public
 reads and writes; use them only with disposable demo data. They expire on
@@ -61,9 +62,12 @@ sending transactions needs Sepolia test ETH for gas, including gate staff.
 3. Return to the organizer. Create an event with a unique title, a future date,
    poster, small quantity (for example 5) and a nominal price (for example 0.001 ETH).
    Save a draft, preview, then publish. Wait for the wallet confirmation and receipt.
-4. If minting succeeds but publishing fails, use **Retry publication**. Keep that
-   browser open; recovery data is also saved there when local storage is available.
-   Do not mint another batch to repair the database write.
+4. Large event supplies are split into safe mint batches. Confirm each wallet
+   prompt and follow the minted/total progress. If cancelled or interrupted, use
+   **Resume publication** in Events; it checks a pending receipt and continues only
+   the remaining inventory. Use the same browser, where recovery is saved. If the
+   wallet submission's hash was lost, paste it into the recovery panel first.
+   Do not create a duplicate event to repair a partial mint or database write.
 5. Sign into a buyer account. Open the event and buy two tickets. Confirm one
    combined transaction on supported deployments. Verify both tickets in `/wallet`.
 6. Open a ticket and view the QR. List one at 0.0011 ETH (110% of a 0.001 ETH face
