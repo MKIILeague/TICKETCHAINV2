@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { motion } from "framer-motion";
 import { MapPin, Clock, Ticket, Search, Tag, CalendarX } from "lucide-react";
@@ -8,14 +8,7 @@ import { EVENT_STATUS, effectiveStatus } from "./eventStatus";
 import { ipfsToHttp } from "./ipfs";
 import { rm, ethLabel } from "./currency";
 
-// UNIX seconds -> "Saturday, Oct 14 at 8:00 PM"
-export function formatEventWindow(unixSec) {
-  if (!unixSec) return "Date to be announced";
-  const d = new Date(unixSec * 1000);
-  const date = d.toLocaleDateString(undefined, { weekday: "long", month: "short", day: "numeric" });
-  const time = d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
-  return `${date} at ${time}`;
-}
+import { formatEventWindow } from "./dateFormat";
 
 /**
  * Public "Events Happening" storefront grid — reads the Firestore `events`
@@ -27,6 +20,7 @@ export default function EventsHappening() {
   const navigate = useNavigate();
   const [events, setEvents] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
   const [q, setQ] = useState("");
 
   useEffect(() => {
@@ -41,10 +35,14 @@ export default function EventsHappening() {
           .filter((ev) => effectiveStatus(ev) === EVENT_STATUS.PUBLISHED)
           .sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
         setEvents(list);
+        setLoadError("");
         setLoading(false);
       },
       (err) => {
         console.error("Events stream failed:", err);
+        setLoadError(err.code === "permission-denied"
+          ? "The event database is unavailable because Firebase denied access. Contact the project administrator."
+          : "Could not load events. Check your connection and reload.");
         setLoading(false);
       }
     );
@@ -80,7 +78,12 @@ export default function EventsHappening() {
         </div>
       </div>
 
-      {loading ? (
+      {loadError ? (
+        <div role="alert" className="rounded-xl border border-red-200 bg-red-50 p-5 text-sm text-red-700">
+          <p>{loadError}</p>
+          <button onClick={() => window.location.reload()} className="mt-3 font-semibold underline">Retry</button>
+        </div>
+      ) : loading ? (
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
           {[0, 1, 2].map((i) => (
             <div key={i} className="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm animate-pulse">

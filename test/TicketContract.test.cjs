@@ -98,7 +98,7 @@ describe("TicketContract", function () {
       // Approve contract for transfer if needed, but ERC721 _transfer handles it for resale
       // Note: In a real environment with value transfer, msg.value must be >= resalePrice
       // Our smart contract implementation currently emits the purchase event
-      await expect(contract.connect(buyer2).batchPurchaseResale([ticketId], { value: resalePrice }))
+      await expect(contract.connect(buyer2).batchPurchaseResale([ticketId], { value: 0n }))
         .to.emit(contract, "TicketPurchased")
         .withArgs(ticketId, buyer2.address, resalePrice);
 
@@ -130,6 +130,82 @@ describe("TicketContract", function () {
       
       // Second scan should fail
       await expect(contract.useTicket(ticketId)).to.be.revertedWith("Ticket already used");
+    });
+
+    it("rejects a buyer trying to consume another user's ticket", async function () {
+      await expect(contract.connect(buyer2).useTicket(ticketId)).to.be.revertedWith("Not authorized to check in tickets");
+    });
+
+    it("supports admin-assigned gatekeepers and revocation", async function () {
+      await contract.setGatekeeper(buyer2.address, true);
+      await contract.connect(buyer2).useTicket(ticketId);
+      expect((await contract.getTicketDetails(ticketId)).isUsed).to.be.true;
+      await contract.connect(organizer).mintTicket(buyer1.address, tokenURI, ticketPrice, eventName);
+      await contract.setGatekeeper(buyer2.address, false);
+      await expect(contract.connect(buyer2).useTicket(2)).to.be.revertedWith("Not authorized to check in tickets");
+    });
+
+    it("rejects nonexistent tickets", async function () {
+      await expect(contract.useTicket(999)).to.be.revertedWithCustomError(contract, "ERC721NonexistentToken");
+    });
+
+    it("delists a used ticket and prevents moving it", async function () {
+      await contract.useTicket(ticketId);
+      expect((await contract.getTicketDetails(ticketId)).isForResale).to.be.false;
+      await expect(contract.connect(buyer1).transferFrom(buyer1.address, buyer2.address, ticketId)).to.be.revertedWith("Ticket already used");
+    });
+  });
+
+  describe("Demo lifecycle regressions", function () {
+    beforeEach(async function () {
+      await contract.whitelistOrganizer(organizer.address);
+      await contract.connect(organizer).batchMintTickets(organizer.address, tokenURI, ticketPrice, eventName, 3);
+    });
+
+    it("purchases several tickets atomically for zero payment", async function () {
+      await contract.connect(buyer1).batchPurchaseResale([1, 2]);
+      expect(await contract.ownerOf(1)).to.equal(buyer1.address);
+      expect(await contract.ownerOf(2)).to.equal(buyer1.address);
+      expect(await ethers.provider.getBalance(await contract.getAddress())).to.equal(0n);
+    });
+
+    it("rejects accidental ETH rather than trapping it in the demo contract", async function () {
+      await expect(contract.connect(buyer1).purchaseResaleTicket(1, { value: ticketPrice })).to.be.revertedWith("Simulated payments only; send zero ETH");
+      await expect(contract.connect(buyer1).batchPurchaseResale([1], { value: ticketPrice })).to.be.revertedWith("Simulated payments only; send zero ETH");
+    });
+
+    it("rolls back an entire batch containing an unavailable ticket", async function () {
+      await contract.connect(buyer2).purchaseResaleTicket(2);
+      await expect(contract.connect(buyer1).batchPurchaseResale([1, 2])).to.be.revertedWith("Ticket not for resale");
+      expect(await contract.ownerOf(1)).to.equal(organizer.address);
+    });
+
+    it("cannot purchase the same token twice or buy your own ticket", async function () {
+      await expect(contract.connect(buyer1).batchPurchaseResale([1, 1])).to.be.revertedWith("Ticket not for resale");
+      await expect(contract.connect(organizer).purchaseResaleTicket(1)).to.be.revertedWith("Cannot buy your own ticket");
+    });
+
+    it("clears stale seller listings when a ticket is gifted", async function () {
+      await contract.connect(organizer).transferFrom(organizer.address, buyer1.address, 1);
+      expect((await contract.getTicketDetails(1)).isForResale).to.be.false;
+      await expect(contract.connect(buyer2).purchaseResaleTicket(1)).to.be.revertedWith("Ticket not for resale");
+    });
+
+    it("pause also blocks direct ERC721 transfers and check-in", async function () {
+      await contract.pause();
+      await expect(contract.connect(organizer).transferFrom(organizer.address, buyer1.address, 1)).to.be.revertedWithCustomError(contract, "EnforcedPause");
+      await expect(contract.connect(buyer1).purchaseResaleTicket(1)).to.be.revertedWithCustomError(contract, "EnforcedPause");
+      await expect(contract.useTicket(1)).to.be.revertedWithCustomError(contract, "EnforcedPause");
+      await contract.unpause();
+      await contract.connect(buyer1).purchaseResaleTicket(1);
+      expect(await contract.ownerOf(1)).to.equal(buyer1.address);
+    });
+
+    it("only the issuing organizer or an authorized gatekeeper can check in", async function () {
+      await contract.whitelistOrganizer(buyer2.address);
+      await expect(contract.connect(buyer2).useTicket(1)).to.be.revertedWith("Not authorized to check in tickets");
+      await contract.connect(organizer).useTicket(1);
+      expect((await contract.getTicketDetails(1)).isUsed).to.be.true;
     });
   });
 });

@@ -1,10 +1,10 @@
-import React, { useState, useEffect } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { useLocation, Link } from "react-router-dom";
 import { ethers } from "ethers";
 import {
   Wallet, Send, Tag, Search, Compass, MapPin,
   Clock, RefreshCw, Copy, Check, ExternalLink, QrCode, Info,
-  Ticket, ShieldCheck, ArrowRight, Zap, X, Ban, CheckCircle2,
+  ShieldCheck, ArrowRight, Zap, X, Ban, CheckCircle2,
   CalendarClock, AlertTriangle, History, ChevronLeft, ChevronRight,
   Maximize2, Hash, Wifi
 } from "lucide-react";
@@ -13,10 +13,12 @@ import { CONTRACT_ABI, PUBLIC_RPC_URL, getContractAddress, getDeployments } from
 import {
   EVENT_STATUS, normalizeEventName, isTransferFrozen, fetchPublicEventStatusMap
 } from "./eventStatus";
-import EventsHappening, { formatEventWindow } from "./EventsHappening";
+import EventsHappening from "./EventsHappening";
+import { formatEventWindow } from "./dateFormat";
 import heroSlideConfetti from "./assets/slides/slide3.jpeg";
 import heroSlideStage from "./assets/slides/slide1.jpg";
 import heroSlideAerial from "./assets/slides/slide2.jpeg";
+import { ownedTokenIds, ticketKey, queryTicketLogs } from "./ticketUtils";
 import { QRCodeSVG } from "qrcode.react";
 import { rm, ethLabel } from "./currency";
 
@@ -39,7 +41,7 @@ async function mapLimit(items, limit, fn) {
 
 // The secure entry packet encoded into every ticket QR: token id + owner + the
 // on-chain validation anchor (contract address + chain). The gate scanner reads
-// live chain state for this token, so an offline screenshot can't be replayed.
+// live chain state for this token, so a stale owner or already-used token is rejected.
 // Shared by the card preview and the full-screen ticket popup so the two can
 // never encode different payloads for the same ticket.
 function buildQrPayload(ticket, owner, contractAddress, chainId) {
@@ -64,6 +66,8 @@ async function withRetry(fn, tries = 3) {
 
 const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) => {
   const location = useLocation();
+  const walletRef = useRef(wallet);
+  useEffect(() => { walletRef.current = wallet; }, [wallet]);
   // Post-purchase confirmation passed from the checkout page (router state).
   const [purchaseBanner, setPurchaseBanner] = useState(location.state?.purchased || null);
 
@@ -180,13 +184,10 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
   // got every read dropped (count showed, no cards). So we discover the wallet's
   // tokens from Transfer event logs (incoming minus outgoing = 2 cheap log
   // queries) and fetch getTicketDetails only for the few tokens it owns.
-  const SEPOLIA_READ_RPCS = [
-    PUBLIC_RPC_URL,               // primary (sepolia.drpc.org)
-    "https://1rpc.io/sepolia",    // verified fallback
-    "https://sepolia.drpc.org",
-  ];
 
-  const fetchDashboardData = async () => {
+
+  const fetchDashboardData = useCallback(async () => {
+    const wallet = walletRef.current;
     setIsLoadingTickets(true);
     try {
       // 1) Which chain do we read from? The app is Sepolia-only (see main.jsx
@@ -220,7 +221,7 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
       // tickets bought on an older contract are orphaned unless we scan it too.
       const deployments = getDeployments(chainId);
       const primary = deployments[0];
-      const urls = chainId === 31337 ? ["http://127.0.0.1:8545"] : [...new Set(SEPOLIA_READ_RPCS)];
+      const urls = chainId === 31337 ? ["http://127.0.0.1:8545"] : [PUBLIC_RPC_URL];
 
       // Ordered read providers to try. The embedded wallet's OWN RPC (Privy/
       // Alchemy-backed) has generous eth_getLogs limits and is proven reliable —
@@ -230,7 +231,7 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
       // which is why a freshly-bought ticket never appeared in "Your tickets".
       const readProviders = [];
       if (walletMatchesChain && walletProvider) readProviders.push(walletProvider);
-      urls.forEach((u) => readProviders.push(new ethers.JsonRpcProvider(u)));
+      urls.forEach((u) => readProviders.push(new ethers.JsonRpcProvider(u, undefined, { batchMaxCount: 1 })));
 
       // 2) Native ETH balance FIRST, and independently of the heavier historical
       //    log queries below. `getBalance` works on ANY provider, so a funded
@@ -260,7 +261,7 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
         try {
           if (walletAddress) {
             const c = new ethers.Contract(primary.address, CONTRACT_ABI, p);
-            await c.queryFilter(c.filters.Transfer(null, walletAddress), primary.startBlock);
+            await queryTicketLogs(c, c.filters.Transfer(null, walletAddress), primary.startBlock);
           } else {
             await p.getBlockNumber();
           }
@@ -292,11 +293,10 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
         try {
           const c = new ethers.Contract(dep.address, CONTRACT_ABI, provider);
           const [incoming, outgoing] = await Promise.all([
-            c.queryFilter(c.filters.Transfer(null, walletAddress), dep.startBlock),
-            c.queryFilter(c.filters.Transfer(walletAddress, null), dep.startBlock),
+            queryTicketLogs(c, c.filters.Transfer(null, walletAddress), dep.startBlock),
+            queryTicketLogs(c, c.filters.Transfer(walletAddress, null), dep.startBlock),
           ]);
-          const owned = new Set(incoming.map((l) => l.args[2].toString()));
-          outgoing.forEach((l) => owned.delete(l.args[2].toString()));
+          const owned = ownedTokenIds(incoming, outgoing, walletAddress);
           const iAmOrganizer = await c.whitelistedOrganizers(walletAddress).catch(() => false);
           const rows = await mapLimit([...owned], 4, async (id) => {
             try {
@@ -304,6 +304,7 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
               return {
                 id: id.toString(),
                 contractAddress: dep.address,
+                chainId,
                 eventTitle: details.eventName || `Ticket #${id}`,
                 mintPrice: parseFloat(ethers.formatEther(details.originalPrice || 0n)),
                 isUsed: details.isUsed || false,
@@ -328,13 +329,14 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
         }
       }));
 
-      // Flatten newest-first; dedupe colliding token ids (newest contract wins)
-      // so the per-id lookups in the resale/transfer handlers stay unambiguous.
+      // Keep every deployment: the same token ID on two contracts represents
+      // two different tickets. Actions carry the complete ticket identity.
       const seen = new Set();
       const ticketList = [];
       perContract.forEach((rows) => rows.forEach((t) => {
-        if (seen.has(t.id)) return;
-        seen.add(t.id);
+        const key = ticketKey(t);
+        if (seen.has(key)) return;
+        seen.add(key);
         ticketList.push(t);
       }));
 
@@ -345,13 +347,13 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
     } finally {
       setIsLoadingTickets(false);
     }
-  };
+  }, [walletAddress]);
 
   // Depend on the stable address string, not the `wallet` object (its identity
   // changes every render, which caused an infinite fetch/abort loop).
   useEffect(() => {
-    fetchDashboardData();
-  }, [walletAddress]);
+    void Promise.resolve().then(fetchDashboardData);
+  }, [fetchDashboardData]);
 
   // Arriving straight from checkout, the public RPC's log index can still be
   // several blocks behind, so the just-bought ticket may not be visible on the
@@ -361,8 +363,7 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
     if (!purchaseBanner || !walletAddress) return;
     const timers = [1500, 4000, 9000, 15000].map((ms) => setTimeout(() => fetchDashboardData(), ms));
     return () => timers.forEach(clearTimeout);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [purchaseBanner, walletAddress]);
+  }, [purchaseBanner, walletAddress, fetchDashboardData]);
 
   // Pull the Firestore event-status overlay once (and whenever tickets reload).
   useEffect(() => {
@@ -372,12 +373,12 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
   // A ticket may live on an older contract deployment (it was minted/bought
   // before the last redeploy). Resale/transfer must target THAT contract, not
   // the current one — otherwise the token doesn't exist there and the tx reverts.
-  const contractForTicket = (ticketId) =>
-    tickets.find((t) => t.id === String(ticketId))?.contractAddress || getContractAddress(activeChainId);
+  const contractForTicket = (ticket) => ticket.contractAddress;
 
-  const onListResale = async (ticketId, price) => {
+  const onListResale = async (ticket, price) => {
+    const ticketId = ticket.id;
     if (!wallet) return;
-    const resaleTarget = tickets.find((t) => t.id === String(ticketId));
+    const resaleTarget = ticket;
     if (resaleTarget && isTransferFrozen(statusFor(resaleTarget.eventTitle))) {
       addNotification("This event was canceled — resale and transfers are frozen.", "error");
       return false;
@@ -389,7 +390,7 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
       const network = await provider.getNetwork();
       const currentChainId = Number(network.chainId);
       // Sepolia-only in production; the local Hardhat node is a dev-only path.
-      const targetChainId = (import.meta.env.DEV && currentChainId === 31337) ? 31337 : 11155111;
+      const targetChainId = ticket.chainId || ((import.meta.env.DEV && currentChainId === 31337) ? 31337 : 11155111);
 
       if (currentChainId !== targetChainId) {
         await wallet.switchChain(targetChainId);
@@ -408,7 +409,7 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
       }
 
       const signer = await provider.getSigner();
-      const contractAddress = contractForTicket(ticketId);
+      const contractAddress = contractForTicket(ticket);
       const contract = new ethers.Contract(contractAddress, CONTRACT_ABI, signer);
       const priceInWei = ethers.parseEther(price.toString());
       const tx = await contract.listTicketForResale(ticketId, priceInWei);
@@ -425,9 +426,10 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
 
   // Returns true only if the listing was actually cancelled on-chain, so the
   // caller knows whether it's safe to close the popup it was pressed from.
-  const onCancelResale = async (ticketId) => {
+  const onCancelResale = async (ticket) => {
+    const ticketId = ticket.id;
     if (!wallet) return false;
-    setCancelingId(String(ticketId));
+    setCancelingId(ticketKey(ticket));
     try {
       let eip1193Provider = await wallet.getEthereumProvider();
       let provider = new ethers.BrowserProvider(eip1193Provider);
@@ -435,7 +437,7 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
       const network = await provider.getNetwork();
       const currentChainId = Number(network.chainId);
       // Sepolia-only in production; the local Hardhat node is a dev-only path.
-      const targetChainId = (import.meta.env.DEV && currentChainId === 31337) ? 31337 : 11155111;
+      const targetChainId = ticket.chainId || ((import.meta.env.DEV && currentChainId === 31337) ? 31337 : 11155111);
 
       if (currentChainId !== targetChainId) {
         await wallet.switchChain(targetChainId);
@@ -454,7 +456,7 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
       }
 
       const signer = await provider.getSigner();
-      const contractAddress = contractForTicket(ticketId);
+      const contractAddress = contractForTicket(ticket);
       const contract = new ethers.Contract(contractAddress, CONTRACT_ABI, signer);
       const tx = await contract.cancelResaleListing(ticketId);
       await tx.wait();
@@ -470,9 +472,10 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
     }
   };
 
-  const onTransfer = async (ticketId, toAddress) => {
+  const onTransfer = async (ticket, toAddress) => {
+    const ticketId = ticket.id;
     if (!wallet) return;
-    const transferTarget = tickets.find((t) => t.id === String(ticketId));
+    const transferTarget = ticket;
     if (transferTarget && isTransferFrozen(statusFor(transferTarget.eventTitle))) {
       addNotification("This event was canceled — transfers are frozen.", "error");
       return false;
@@ -484,7 +487,7 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
       const network = await provider.getNetwork();
       const currentChainId = Number(network.chainId);
       // Sepolia-only in production; the local Hardhat node is a dev-only path.
-      const targetChainId = (import.meta.env.DEV && currentChainId === 31337) ? 31337 : 11155111;
+      const targetChainId = ticket.chainId || ((import.meta.env.DEV && currentChainId === 31337) ? 31337 : 11155111);
 
       if (currentChainId !== targetChainId) {
         await wallet.switchChain(targetChainId);
@@ -503,8 +506,15 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
       }
 
       const signer = await provider.getSigner();
-      const contractAddress = contractForTicket(ticketId);
+      const contractAddress = contractForTicket(ticket);
       const contract = new ethers.Contract(contractAddress, CONTRACT_ABI, signer);
+      if (!ethers.isAddress(toAddress) || toAddress === ethers.ZeroAddress) throw new Error("Enter a valid recipient address.");
+      const live = await contract.getTicketDetails(ticketId);
+      if (live.isUsed) throw new Error("A used ticket cannot be transferred.");
+      if (await contract.paused()) throw new Error("Transfers are currently paused.");
+      // Older deployments do not clear listings on standard NFT transfers.
+      // Cancel first so a gift never inherits the previous owner's listing.
+      if (live.isForResale) await (await contract.cancelResaleListing(ticketId)).wait();
       const tx = await contract.safeTransferFrom(walletAddress, toAddress, ticketId);
       await tx.wait();
       addNotification("Ticket transferred!", "success");
@@ -712,6 +722,7 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
             </div>
           </div>
 
+          {location.state?.syncWarning && <p role="alert" className="mb-4 rounded-xl bg-amber-50 border border-amber-200 p-4 text-sm text-amber-800">{location.state.syncWarning}</p>}
           {/* My tickets */}
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6">
             <div className="flex items-center gap-3 flex-wrap">
@@ -812,18 +823,18 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
               {filteredMyTickets.map(ticket => (
                 <TicketCard
-                  key={ticket.id}
+                  key={ticketKey(ticket)}
                   ticket={ticket}
                   meta={eventStatusMap[normalizeEventName(ticket.eventTitle)]?.ev}
                   status={statusFor(ticket.eventTitle)}
                   owner={walletAddress}
                   contractAddress={ticket.contractAddress || getContractAddress(activeChainId)}
                   chainId={activeChainId}
-                  canceling={cancelingId === ticket.id}
+                  canceling={cancelingId === ticketKey(ticket)}
                   onOpen={() => setDetailTicket(ticket)}
                   onResell={() => { setResaleTicket(ticket); setResalePriceInput(""); }}
                   onTransfer={() => { setTransferTicket(ticket); setRecipientAddress(""); }}
-                  onCancel={() => onCancelResale(ticket.id)}
+                  onCancel={() => onCancelResale(ticket)}
                 />
               ))}
             </div>
@@ -855,7 +866,7 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
             contractAddress={detailTicket.contractAddress || getContractAddress(activeChainId)}
             chainId={activeChainId}
             networkLabel={networkLabel}
-            canceling={cancelingId === detailTicket.id}
+            canceling={cancelingId === ticketKey(detailTicket)}
             onClose={() => setDetailTicket(null)}
             // Resell/transfer hand off to their own sheet, so this one closes to
             // avoid stacking. Cancel has no follow-up sheet: it stays open and
@@ -863,7 +874,7 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
             // would just blank the screen for the 15-30s the tx takes.
             onResell={() => { setResaleTicket(detailTicket); setResalePriceInput(""); setDetailTicket(null); }}
             onTransfer={() => { setTransferTicket(detailTicket); setRecipientAddress(""); setDetailTicket(null); }}
-            onCancel={() => onCancelResale(detailTicket.id).then((ok) => ok && setDetailTicket(null))}
+            onCancel={() => onCancelResale(detailTicket).then((ok) => ok && setDetailTicket(null))}
           />
         )}
 
@@ -899,7 +910,7 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
                 Cancel
               </button>
               <button
-                onClick={() => onListResale(resaleTicket.id, resalePriceInput).then(s => s && setResaleTicket(null))}
+                onClick={() => onListResale(resaleTicket, resalePriceInput).then(s => s && setResaleTicket(null))}
                 disabled={!resalePriceInput || priceExceeded || isPaused}
                 className="flex-1 py-3 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-100 disabled:text-slate-400 text-white rounded-xl font-semibold text-sm transition-colors"
               >
@@ -932,7 +943,7 @@ const BuyerResellerDashboard = ({ walletAddress, wallet, connectWallet, view }) 
                 Cancel
               </button>
               <button
-                onClick={() => onTransfer(transferTicket.id, recipientAddress).then(s => s && setTransferTicket(null))}
+                onClick={() => onTransfer(transferTicket, recipientAddress).then(s => s && setTransferTicket(null))}
                 disabled={!recipientAddress || isPaused}
                 className="flex-1 py-3 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-100 disabled:text-slate-400 text-white rounded-xl font-semibold text-sm transition-colors"
               >
@@ -1519,7 +1530,7 @@ const TicketDetailModal = ({
             <p className="mt-4 flex items-start gap-2 text-[11px] leading-relaxed text-slate-500">
               <Wifi size={13} className="mt-px shrink-0 text-slate-500" />
               Verified live against the blockchain at the gate. An active connection is required — screenshots and
-              offline copies of this QR will be rejected by scanners.
+              scanners reject old owners and already-used tickets. Treat an unused QR like a bearer ticket.
             </p>
           </div>
 

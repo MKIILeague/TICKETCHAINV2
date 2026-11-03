@@ -1,9 +1,10 @@
 import { ethers } from "ethers";
 import dotenv from "dotenv";
+import { readDeployment } from "./scripts/deploymentConfig.js";
 dotenv.config();
 
 async function main() {
-  const contractAddress = "0x881F6A6Ae4ABdfb5a16cDC56f83fe9DF86F57374";
+  const { address: contractAddress, startBlock } = readDeployment('sepolia');
   const rpcUrl = process.env.SEPOLIA_RPC_URL;
   if (!rpcUrl) {
     console.error("Missing SEPOLIA_RPC_URL");
@@ -25,18 +26,18 @@ async function main() {
       topics: [ethers.id("TicketMinted(uint256,address,uint256,string)")]
     };
     
-    // Try to query from block 0
-    console.log("Attempting to query logs from block 0...");
+    // Try to query from the configured deployment block
+    console.log("Attempting to query logs from the configured deployment block...");
     const logs = await provider.getLogs({
       ...filter,
-      fromBlock: 0
+      fromBlock: startBlock
     });
-    console.log("Found", logs.length, "logs querying from block 0.");
+    console.log("Found", logs.length, "logs querying from the configured deployment block.");
     if (logs.length > 0) {
       console.log("First log block:", logs[0].blockNumber);
     }
   } catch (err) {
-    console.error("Error querying from block 0:", err.message);
+    console.error("Error querying from the configured deployment block:", err.message);
   }
 }
 

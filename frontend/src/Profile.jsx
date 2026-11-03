@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import { User, Mail, Calendar, Wallet, Copy, Check, CheckCircle2, LogIn } from "lucide-react";
 import { useTicketWallet } from "./useTicketWallet";
 import { useProfile } from "./useProfile";
@@ -12,8 +12,9 @@ export default function Profile() {
   const { ready, authenticated, address, user, login } = useTicketWallet();
   const { profile, loading, save } = useProfile(address);
 
-  const [name, setName] = useState("");
-  const [birthday, setBirthday] = useState("");
+  const [draft, setDraft] = useState(null);
+  const name = draft?.address === address ? draft.name : profile?.name || "";
+  const birthday = draft?.address === address ? draft.birthday : profile?.birthday || "";
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState("");
@@ -21,11 +22,6 @@ export default function Profile() {
 
   const email = user?.email?.address || null;
 
-  // Seed the form once the stored profile loads (and when switching accounts).
-  useEffect(() => {
-    setName(profile?.name || "");
-    setBirthday(profile?.birthday || "");
-  }, [profile]);
 
   const handleCopy = async () => {
     if (!address) return;
@@ -44,6 +40,7 @@ export default function Profile() {
     setSaving(true);
     try {
       await save({ name, birthday });
+      setDraft(null);
       setSaved(true);
       setTimeout(() => setSaved(false), 2500);
     } catch (e) {
@@ -100,7 +97,7 @@ export default function Profile() {
           <input
             type="text"
             value={name}
-            onChange={(e) => setName(e.target.value)}
+            onChange={(e) => setDraft({ address, name: e.target.value, birthday })}
             placeholder="e.g. Syed Arfan"
             maxLength={60}
             className="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent transition-shadow"
@@ -116,7 +113,7 @@ export default function Profile() {
             type="date"
             value={birthday}
             max={todayISO}
-            onChange={(e) => setBirthday(e.target.value)}
+            onChange={(e) => setDraft({ address, name, birthday: e.target.value })}
             className="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 text-slate-900 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent transition-shadow"
           />
         </div>

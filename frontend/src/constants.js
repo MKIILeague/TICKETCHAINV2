@@ -27,20 +27,23 @@ export const SEPOLIA_DEPLOYMENTS = [
 // NOTE: must support historical `eth_getLogs` across the deployment's block
 // range. publicnode.com is deliberately NOT used here — it rejects historical
 // log queries ("archive requests require a personal token"), which silently
-// returned zero tickets in "Your tickets". drpc.org serves them fine.
-export const PUBLIC_RPC_URL = "https://sepolia.drpc.org";
+// returned zero tickets in "Your tickets". The former drpc endpoint now requires
+// a paid Sepolia plan. Tenderly was checked with this deployment's full logs.
+export const PUBLIC_RPC_URL = "https://sepolia.gateway.tenderly.co";
 
 // Exporting the exact interface layout definitions
 export const CONTRACT_ABI = contractJson.abi;
 
 // Returns the contract address for the active network.
 // - 31337 (local Hardhat node) -> the local deployment address
-// - everything else            -> the Sepolia address above
+// - 11155111 (Sepolia)        -> the Sepolia address above
+// Unsupported networks are rejected instead of silently using a wrong address.
 export function getContractAddress(chainId) {
   if (Number(chainId) === 31337) {
     return "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"; // Localhost Hardhat address (auto-set by setupLocal.js, block 2)
   }
-  return CONTRACT_ADDRESS;
+  if (Number(chainId) === 11155111) return CONTRACT_ADDRESS;
+  throw new Error(`Unsupported network ${chainId}. Switch to Sepolia.`);
 }
 
 // The list of {address, startBlock} the wallet should scan for a given chain.
@@ -49,5 +52,6 @@ export function getDeployments(chainId) {
   if (Number(chainId) === 31337) {
     return [{ address: getContractAddress(31337), startBlock: 0 }];
   }
-  return SEPOLIA_DEPLOYMENTS;
+  if (Number(chainId) === 11155111) return SEPOLIA_DEPLOYMENTS;
+  throw new Error(`Unsupported network ${chainId}. Switch to Sepolia.`);
 }

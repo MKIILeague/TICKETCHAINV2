@@ -5,3 +5,7 @@ artifacts
 
 # Personal FYP report files (kept out of the codebase)
 Report/
+
+# Local verification output
+.local-cache/
+.lint-baseline.json

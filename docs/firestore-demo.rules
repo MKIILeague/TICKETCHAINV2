@@ -1,0 +1,12 @@
+rules_version = '2';
+// PRESENTATION ONLY. These collections are publicly readable AND writable until
+// 5 November 2026 00:00 UTC. Use only disposable demo data; never real user data.
+// Not a production authorization model. Privy login is not Firebase Auth.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{collection}/{document} {
+      allow read, write: if collection in ['events', 'organisers', 'staff', 'profiles']
+                        && request.time < timestamp.date(2026, 11, 5);
+    }
+  }
+}

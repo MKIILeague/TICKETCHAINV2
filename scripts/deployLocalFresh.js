@@ -7,6 +7,7 @@ import path from "path";
 
 async function main() {
   const { ethers } = hre;
+  if (Number((await ethers.provider.getNetwork()).chainId) !== 31337) throw new Error('Local deployment only: use --network localhost.');
   const [deployer] = await ethers.getSigners();
   console.log("🚀 Deploying fresh TicketContract to localhost...");
   console.log("   Deployer/owner:", deployer.address);

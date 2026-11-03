@@ -1,6 +1,6 @@
-import React, { useState } from "react";
+import { useState } from "react";
 import { BrowserRouter, Routes, Route, Outlet, NavLink, Link, Navigate } from "react-router-dom";
-import { Wallet, LogIn, LogOut, Building2, Menu, X, User, Repeat } from "lucide-react";
+import { LogIn, LogOut, Building2, Menu, X, User, Repeat } from "lucide-react";
 import BrandMark from "./BrandMark";
 import { useTicketWallet } from "./useTicketWallet";
 import { useProfile } from "./useProfile";
@@ -77,7 +77,7 @@ function Navbar() {
             <span className="inline-flex items-center gap-1.5"><Building2 size={14} /> Organizer</span>
           </NavLink>
           {isAdmin && <NavLink to="/admin/dashboard" className={link}>Admin</NavLink>}
-          {isGatekeeper && <NavLink to="/gatekeeper" className={link}>Gate</NavLink>}
+          {(isGatekeeper || isAdmin) && <NavLink to="/gatekeeper" className={link}>Gate</NavLink>}
         </div>
 
         {/* Auth Buttons */}
@@ -129,7 +129,7 @@ function Navbar() {
             <span className="inline-flex items-center gap-1.5"><Building2 size={16} /> Organizer</span>
           </NavLink>
           {isAdmin && <NavLink to="/admin/dashboard" onClick={() => setIsOpen(false)} className={mobileLink}>Admin Dashboard</NavLink>}
-          {isGatekeeper && <NavLink to="/gatekeeper" onClick={() => setIsOpen(false)} className={mobileLink}>Gate Terminal</NavLink>}
+          {(isGatekeeper || isAdmin) && <NavLink to="/gatekeeper" onClick={() => setIsOpen(false)} className={mobileLink}>Gate Terminal</NavLink>}
         </div>
       )}
     </header>
@@ -254,7 +254,7 @@ export default function App() {
 
         {/* Bare full-screen routes — no consumer navbar */}
         <Route path="/organizer/dashboard" element={<RequireRole allow={["organizer"]} redirectTo="/organizer"><OrganizerDashboardPage /></RequireRole>} />
-        <Route path="/gatekeeper" element={<RequireRole allow={["gatekeeper"]}><GatekeeperPage /></RequireRole>} />
+        <Route path="/gatekeeper" element={<RequireRole allow={["gatekeeper", "admin"]}><GatekeeperPage /></RequireRole>} />
         <Route path="/admin/dashboard" element={<RequireRole allow={["admin"]} redirectTo="/admin/login"><AdminConsolePage /></RequireRole>} />
       </Routes>
     </BrowserRouter>

@@ -1,7 +1,6 @@
 import { StrictMode, Component } from 'react'
 import { createRoot } from 'react-dom/client'
 import { PrivyProvider } from '@privy-io/react-auth'
-import { defineChain } from 'viem'
 import { sepolia } from 'viem/chains'
 import './index.css'
 import App from './App.jsx'
@@ -13,25 +12,6 @@ if (hostname === '127.0.0.1' || hostname === '[::1]' || hostname === '::1') {
   window.location.href = window.location.href.replace(hostname, 'localhost')
 }
 
-// Define Hardhat Localhost for Privy
-const hardhatChain = defineChain({
-  id: 31337,
-  name: 'Hardhat Localhost',
-  network: 'hardhat',
-  nativeCurrency: {
-    decimals: 18,
-    name: 'Ether',
-    symbol: 'ETH',
-  },
-  rpcUrls: {
-    default: {
-      http: ['http://127.0.0.1:8545'],
-    },
-    public: {
-      http: ['http://127.0.0.1:8545'],
-    },
-  },
-})
 
 // Surfaces render/origin/403 errors instead of a blank (black) screen so the
 // app never fails silently. (Documented behavior — see CLAUDE.md.)
@@ -78,7 +58,7 @@ createRoot(document.getElementById('root')).render(
         config={{
           loginMethods: ['email', 'google'],
           embeddedWallets: {
-            createOnLogin: 'all-users',
+            ethereum: { createOnLogin: 'all-users' },
           },
           defaultChain: sepolia,
           supportedChains: [sepolia],

@@ -25,6 +25,7 @@ const FUND_ETH  = "10"; // test ETH to send each wallet for gas
 
 async function main() {
   const { ethers } = hre;
+  if (Number((await ethers.provider.getNetwork()).chainId) !== 31337) throw new Error('Local setup only: use --network localhost.');
   const [deployer] = await ethers.getSigners(); // Hardhat account 0 = initial owner
 
   console.log("🚀 Local setup starting...");

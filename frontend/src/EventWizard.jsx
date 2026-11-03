@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { ethers } from "ethers";
 import {
   Calendar, MapPin, Tag, FileText, Hash, DollarSign, UploadCloud,
@@ -13,6 +13,8 @@ import {
 } from "./ipfs";
 import { EVENT_STATUS, effectiveStatus, cancelEvent, softDeleteEvent } from "./eventStatus";
 import { rm, ethLabel } from "./currency";
+
+import { readPendingPublish, savePendingPublish, clearPendingPublish } from "./publishRecovery";
 
 const CATEGORIES = ["Concert", "Sports", "Theatre", "Conference"];
 
@@ -42,7 +44,9 @@ function formatEventDate(unixSec) {
  *  - Preview     → buyer-facing mock-up of the event page
  *  - Publish     → IPFS metadata → batchMintTickets → mutate status:"published"
  */
-export default function EventWizard({ wallet, walletAddress, orgData, isPaused, activeChainId, onPublished }) {
+export default function EventWizard({ wallet, walletAddress, orgData, isPaused, onPublished }) {
+  const [pendingPublish, setPendingPublish] = useState(() => readPendingPublish(walletAddress));
+  const pendingForWallet = pendingPublish?.walletAddress === walletAddress ? pendingPublish : null;
   const [view, setView] = useState("list"); // list | edit | preview
   const [events, setEvents] = useState([]);
   const [loadingList, setLoadingList] = useState(false);
@@ -70,7 +74,7 @@ export default function EventWizard({ wallet, walletAddress, orgData, isPaused, 
   const canceled = visible.filter((e) => e.status === EVENT_STATUS.CANCELED);
 
   // ── Load this organiser's events ──
-  const loadEvents = async () => {
+  const loadEvents = useCallback(async () => {
     if (!walletAddress) return;
     setLoadingList(true);
     try {
@@ -85,9 +89,9 @@ export default function EventWizard({ wallet, walletAddress, orgData, isPaused, 
     } finally {
       setLoadingList(false);
     }
-  };
+  }, [walletAddress]);
 
-  useEffect(() => { loadEvents(); /* eslint-disable-next-line */ }, [walletAddress]);
+  useEffect(() => { void Promise.resolve().then(loadEvents); }, [loadEvents]);
 
   // ── Form helpers ──
   const set = (k) => (e) => { setForm((f) => ({ ...f, [k]: e.target.value })); setError(""); };
@@ -142,9 +146,12 @@ export default function EventWizard({ wallet, walletAddress, orgData, isPaused, 
     if (!form.category) return "Choose a category.";
     if (!form.venue.trim()) return "Add a venue name & location.";
     if (!posterFile && !currentImageHash) return "Upload an event poster image.";
-    const supply = parseInt(form.totalSupply, 10);
-    if (!Number.isInteger(supply) || supply <= 0) return "Total quantity must be a whole number greater than 0.";
-    if (!(parseFloat(form.price) > 0)) return "Ticket price must be greater than 0.";
+    const eventTime = new Date(form.dateTime).getTime();
+    if (!Number.isFinite(eventTime) || eventTime <= Date.now()) return "Choose an event date in the future.";
+    const supply = Number(form.totalSupply);
+    if (!Number.isSafeInteger(supply) || supply <= 0) return "Total quantity must be a whole number greater than 0.";
+    try { if (ethers.parseEther(form.price) <= 0n) return "Ticket price must be greater than 0."; }
+    catch { return "Enter a decimal ETH price with at most 18 decimal places."; }
     if (!isIpfsConfigured()) return "IPFS isn't configured — add VITE_PINATA_JWT to frontend/.env (see .env.example).";
     return null;
   };
@@ -217,8 +224,24 @@ export default function EventWizard({ wallet, walletAddress, orgData, isPaused, 
   };
 
   // ── Publish (the heavy web3 pipeline) ──
+  const recoverPublish = async () => {
+    if (!pendingForWallet || busy) return;
+    setPhase("sync"); setError("");
+    try {
+      await updateDoc(doc(db, "events", pendingForWallet.id), pendingForWallet.payload);
+      try { clearPendingPublish(walletAddress); } catch { /* storage may be unavailable */ }
+      setPendingPublish(null);
+      await loadEvents(); onPublished?.();
+      resetForm(); setView("list"); setPhase("idle");
+    } catch (error) {
+      setPhase("error");
+      setError("Tickets are already minted. Database publication is still pending: " + error.message);
+    }
+  };
+
   const handlePublish = async () => {
     if (busy) return;
+    if (pendingForWallet) { await recoverPublish(); return; }
     const v = validateFull();
     if (v) { setError(v); return; }
     if (!wallet || !walletAddress) { setError("Connect your wallet first."); return; }
@@ -226,6 +249,7 @@ export default function EventWizard({ wallet, walletAddress, orgData, isPaused, 
     const quantity = parseInt(form.totalSupply, 10);
     const ts = Math.floor(new Date(form.dateTime).getTime() / 1000);
     let diagChainId = null, diagContract = null;
+    let confirmedMint = null;
 
     try {
       // ── Step A — IPFS payload (pin poster if needed, then metadata) ─────────
@@ -271,7 +295,7 @@ export default function EventWizard({ wallet, walletAddress, orgData, isPaused, 
       const contractAddress = getContractAddress(targetChainId);
       diagChainId = targetChainId; diagContract = contractAddress;
       const contract = new ethers.Contract(contractAddress, CONTRACT_ABI, signer);
-      const priceInWei = ethers.parseEther(String(form.price)); // permanent face value (110% resale floor)
+      const priceInWei = ethers.parseEther(String(form.price)); // permanent face value (110% resale ceiling)
 
       try {
         await contract.batchMintTickets.staticCall(walletAddress, tokenURI, priceInWei, form.headline.trim(), quantity);
@@ -304,8 +328,13 @@ export default function EventWizard({ wallet, walletAddress, orgData, isPaused, 
 
       // ── Step C — Firestore mutation: draft → published ──────────────────────
       setPhase("sync");
-      await updateDoc(doc(db, "events", id), {
+      const publishPayload = {
         status: "published",
+        mintBlock: receipt.blockNumber,
+        ticketIds: receipt.logs.flatMap((log) => {
+          try { const event = contract.interface.parseLog(log); return event?.name === "TicketMinted" ? [event.args[0].toString()] : []; }
+          catch { return []; }
+        }),
         ipfsHash: metadataCid,
         contractAddress,
         txHash: receipt?.hash || tx.hash,
@@ -315,7 +344,13 @@ export default function EventWizard({ wallet, walletAddress, orgData, isPaused, 
         priceEth: form.price,
         publishedAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
-      });
+      };
+      confirmedMint = { walletAddress, id, payload: publishPayload };
+      setPendingPublish(confirmedMint);
+      try { savePendingPublish(walletAddress, confirmedMint); } catch (error) { console.warn("Could not persist publish recovery:", error); }
+      await updateDoc(doc(db, "events", id), publishPayload);
+      try { clearPendingPublish(walletAddress); } catch { /* storage may be unavailable */ }
+      setPendingPublish(null);
 
       setPhase("done");
       onPublished?.();
@@ -327,6 +362,11 @@ export default function EventWizard({ wallet, walletAddress, orgData, isPaused, 
     } catch (err) {
       console.error("Publish failed:", err);
       setPhase("error");
+      if (confirmedMint) {
+        setError("The mint is confirmed, but publication did not finish. Retry database publication below; do not mint again.");
+        setView("list");
+        return;
+      }
       const reason = err?.reason || err?.data?.message || err?.message || "Unknown error";
       if (err?.code === "ACTION_REJECTED" || /rejected|denied/i.test(reason)) {
         setError("You cancelled the transaction. The event is still a draft.");
@@ -384,12 +424,19 @@ export default function EventWizard({ wallet, walletAddress, orgData, isPaused, 
   if (view === "list") {
     return (
       <div className="max-w-5xl space-y-8">
+        {pendingForWallet && (
+          <div role="alert" className="rounded-xl border border-amber-200 bg-amber-50 p-5 text-sm text-amber-900">
+            <p>Tickets have already been minted. Finish publishing this event without minting again.</p>
+            <button disabled={busy} onClick={recoverPublish} className="mt-3 rounded-lg bg-amber-700 px-4 py-2 text-white disabled:opacity-40">Retry publication</button>
+          </div>
+        )}
+        {error && <p role="alert" className="text-sm text-red-600">{error}</p>}
         <div className="flex items-center justify-between gap-4">
           <div>
             <h2 className="text-xl font-bold tracking-tight text-slate-900">Events</h2>
             <p className="text-slate-500 mt-1 text-sm">Draft, preview, then publish on-chain.</p>
           </div>
-          <button onClick={newEvent} className="inline-flex items-center gap-2 px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl font-semibold text-sm transition-colors shrink-0">
+          <button disabled={!!pendingForWallet || busy} onClick={newEvent} className="inline-flex items-center gap-2 px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl font-semibold text-sm transition-colors shrink-0">
             <Plus size={16} /> New event
           </button>
         </div>

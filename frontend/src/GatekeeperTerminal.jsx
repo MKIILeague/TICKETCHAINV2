@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import { useState, useRef } from "react";
 import { ethers } from "ethers";
 import {
   CheckCircle2, XCircle, Search, ShieldCheck, RefreshCw,
@@ -7,10 +7,16 @@ import {
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Scanner } from '@yudiel/react-qr-scanner';
-import { CONTRACT_ABI, getContractAddress } from "./constants";
+import { CONTRACT_ABI, getContractAddress, getDeployments } from "./constants";
 import { fetchEventStatusByName, isSaleBlocked, EVENT_STATUS } from "./eventStatus";
 
+import { parseTicketQr } from "./ticketUtils";
+
 const GatekeeperTerminal = ({ walletAddress, wallet, connectWallet }) => {
+  const scanLock = useRef(false);
+  const admissionLock = useRef(false);
+  const [admitting, setAdmitting] = useState(false);
+  const [scanError, setScanError] = useState("");
   const [tokenId, setTokenId] = useState("");
   const [ticketDetails, setTicketDetails] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -22,122 +28,66 @@ const GatekeeperTerminal = ({ walletAddress, wallet, connectWallet }) => {
   const [netLabel, setNetLabel] = useState("Sepolia");
 
   const resetScan = () => {
-    setScanStatus("IDLE");
-    setTicketDetails(null);
-    setEventStatus(null);
-    setTokenId("");
+    if (admissionLock.current) return;
+    setScanStatus("IDLE"); setTicketDetails(null); setEventStatus(null); setTokenId(""); setScanError("");
   };
 
-  const handleScan = async (e, overrideTokenId = null) => {
-    if (e) e.preventDefault();
-    const targetId = overrideTokenId || tokenId;
-    if (!targetId || !wallet) return;
-
-    setLoading(true);
-    setScanStatus("IDLE");
+  const handleScan = async (e, packet = null) => {
+    e?.preventDefault();
+    if (scanLock.current || admissionLock.current || !wallet) return;
+    const targetId = String(packet?.tokenId || tokenId);
+    if (!/^\d+$/.test(targetId) || BigInt(targetId) <= 0n) { setScanError("Enter a positive ticket ID."); return; }
+    scanLock.current = true;
+    setLoading(true); setScanStatus("IDLE"); setScanError(""); setTicketDetails(null);
     try {
-      let eip1193Provider = await wallet.getEthereumProvider();
-      let provider = new ethers.BrowserProvider(eip1193Provider);
-
-      const network = await provider.getNetwork();
-      const currentChainId = Number(network.chainId);
-      const targetChainId = (currentChainId === 31337 || currentChainId === 11155111) ? currentChainId : 11155111;
-      setNetLabel(targetChainId === 31337 ? "Localhost" : "Sepolia");
-
+      let provider = new ethers.BrowserProvider(await wallet.getEthereumProvider());
+      const currentChainId = Number((await provider.getNetwork()).chainId);
+      const targetChainId = packet?.chainId || (import.meta.env.DEV && currentChainId === 31337 ? 31337 : 11155111);
+      if (targetChainId === 31337 && !import.meta.env.DEV) throw new Error("Local tickets require the local development app.");
       if (currentChainId !== targetChainId) {
         await wallet.switchChain(targetChainId);
-        eip1193Provider = await wallet.getEthereumProvider();
-        provider = new ethers.BrowserProvider(eip1193Provider);
+        provider = new ethers.BrowserProvider(await wallet.getEthereumProvider());
       }
-
-      const contractAddress = getContractAddress(targetChainId);
+      setNetLabel(targetChainId === 31337 ? "Localhost" : "Sepolia");
+      const contractAddress = packet?.contract || getContractAddress(targetChainId);
       const contract = new ethers.Contract(contractAddress, CONTRACT_ABI, provider);
-
-      const details = await contract.getTicketDetails(targetId);
-      const owner = await contract.ownerOf(targetId);
-
-      setTicketDetails({
-        id: targetId,
-        eventName: details.eventName,
-        isUsed: details.isUsed,
-        owner: owner
-      });
-
-      // Lifecycle gate — a canceled or finished event denies entry regardless of
-      // the on-chain ticket state. Check Firestore status FIRST so we never wave
-      // through a valid QR for a dead event.
-      const evStatus = await fetchEventStatusByName(details.eventName);
-      if (isSaleBlocked(evStatus)) {
-        setEventStatus(evStatus);
-        setScanStatus("EVENT_BLOCKED");
-        setStats((s) => ({ ...s, scanned: s.scanned + 1, denied: s.denied + 1 }));
-      } else if (details.isUsed) {
-        setScanStatus("CONSUMED");
-        setStats((s) => ({ ...s, scanned: s.scanned + 1, denied: s.denied + 1 }));
-      } else {
-        setScanStatus("VALID");
-        setStats((s) => ({ ...s, scanned: s.scanned + 1 }));
-      }
+      const [details, owner] = await Promise.all([contract.getTicketDetails(targetId), contract.ownerOf(targetId)]);
+      if (packet && owner.toLowerCase() !== packet.owner.toLowerCase()) throw new Error("This QR belongs to a previous ticket owner. Ask for the current owner's QR.");
+      const evStatus = await fetchEventStatusByName(details.eventName, { strict: true });
+      setTicketDetails({ id: targetId, eventName: details.eventName, isUsed: details.isUsed, owner, contractAddress, chainId: targetChainId });
+      const blocked = isSaleBlocked(evStatus);
+      setEventStatus(evStatus);
+      setScanStatus(blocked ? "EVENT_BLOCKED" : details.isUsed ? "CONSUMED" : "VALID");
+      setStats((v) => ({ ...v, scanned: v.scanned + 1, denied: v.denied + (blocked || details.isUsed ? 1 : 0) }));
     } catch (error) {
       console.error("Scan failed:", error);
-      setScanStatus("INVALID");
-      setTicketDetails(null);
-      setStats((s) => ({ ...s, scanned: s.scanned + 1, denied: s.denied + 1 }));
-    } finally {
-      setLoading(false);
-    }
+      setScanStatus("INVALID"); setTicketDetails(null);
+      setScanError(error.reason || error.shortMessage || error.message || "Unable to verify the ticket.");
+      setStats((v) => ({ ...v, scanned: v.scanned + 1, denied: v.denied + 1 }));
+    } finally { scanLock.current = false; setLoading(false); }
   };
 
   const handleUseTicket = async () => {
-    if (!ticketDetails || ticketDetails.isUsed || !wallet) return;
-
-    // Re-check lifecycle before spending gas — block voiding for a dead event.
-    const evStatus = await fetchEventStatusByName(ticketDetails.eventName);
-    if (isSaleBlocked(evStatus)) {
-      setEventStatus(evStatus);
-      setScanStatus("EVENT_BLOCKED");
-      return;
-    }
-
+    if (!ticketDetails || ticketDetails.isUsed || !wallet || admissionLock.current) return;
+    admissionLock.current = true; setAdmitting(true); setScanError("");
     try {
-      let eip1193Provider = await wallet.getEthereumProvider();
-      let provider = new ethers.BrowserProvider(eip1193Provider);
-
-      const network = await provider.getNetwork();
-      const currentChainId = Number(network.chainId);
-      const targetChainId = (currentChainId === 31337 || currentChainId === 11155111) ? currentChainId : 11155111;
-
-      if (currentChainId !== targetChainId) {
-        await wallet.switchChain(targetChainId);
-        eip1193Provider = await wallet.getEthereumProvider();
-        provider = new ethers.BrowserProvider(eip1193Provider);
-      }
-
-      // Pre-flight gas check
-      const balance = await provider.getBalance(walletAddress);
-      const balanceInEth = parseFloat(ethers.formatEther(balance));
-      const requiredGas = 0.0003; // Safe margin
-
-      if (balanceInEth < requiredGas) {
-        alert(`❌ Insufficient funds for gas!\n\nYou currently have ${balanceInEth.toFixed(4)} ETH, but you need at least ${requiredGas} ETH to send this transaction.\n\nPlease fund your wallet before trying again.`);
-        return;
-      }
-
+      const evStatus = await fetchEventStatusByName(ticketDetails.eventName, { strict: true });
+      if (isSaleBlocked(evStatus)) { setEventStatus(evStatus); setScanStatus("EVENT_BLOCKED"); return; }
+      await wallet.switchChain(ticketDetails.chainId);
+      const provider = new ethers.BrowserProvider(await wallet.getEthereumProvider());
       const signer = await provider.getSigner();
-      const contractAddress = getContractAddress(targetChainId);
-      const contract = new ethers.Contract(contractAddress, CONTRACT_ABI, signer);
-
+      const contract = new ethers.Contract(ticketDetails.contractAddress, CONTRACT_ABI, signer);
+      const [live, owner] = await Promise.all([contract.getTicketDetails(ticketDetails.id), contract.ownerOf(ticketDetails.id)]);
+      if (live.isUsed) { setScanStatus("CONSUMED"); setTicketDetails({ ...ticketDetails, isUsed: true }); return; }
+      if (owner.toLowerCase() !== ticketDetails.owner.toLowerCase()) throw new Error("Ownership changed since scanning. Scan the new owner's QR.");
       const tx = await contract.useTicket(ticketDetails.id);
       await tx.wait();
-
-      setScanStatus("CONSUMED");
-      setTicketDetails({ ...ticketDetails, isUsed: true });
-      setStats((s) => ({ ...s, admitted: s.admitted + 1 }));
-      alert("Entry recorded! Ticket voided.");
+      setScanStatus("CONSUMED"); setTicketDetails({ ...ticketDetails, isUsed: true });
+      setStats((v) => ({ ...v, admitted: v.admitted + 1 }));
     } catch (error) {
-      console.error("Use ticket failed:", error);
-      alert(error.reason || error.message || "Transaction failed");
-    }
+      console.error("Check-in failed:", error);
+      setScanError(error.reason || error.shortMessage || error.message || "Check-in failed. Try again.");
+    } finally { admissionLock.current = false; setAdmitting(false); }
   };
 
   const short = (a) => (a ? `${a.substring(0, 6)}…${a.substring(a.length - 4)}` : "");
@@ -200,6 +150,7 @@ const GatekeeperTerminal = ({ walletAddress, wallet, connectWallet }) => {
           {/* ── Scanner card ── */}
           <section className="rounded-3xl border border-white/10 bg-white/[0.03] backdrop-blur-sm p-5 sm:p-6 shadow-2xl shadow-black/40">
             <button
+              disabled={loading || admitting}
               onClick={() => setIsScanning((s) => !s)}
               className={`w-full py-4 rounded-2xl font-bold text-sm tracking-wide transition-all flex items-center justify-center gap-2.5 border ${
                 isScanning
@@ -221,15 +172,13 @@ const GatekeeperTerminal = ({ walletAddress, wallet, connectWallet }) => {
                   <Scanner
                     onScan={(result) => {
                       if (result && result.length > 0 && result[0].rawValue) {
+                        setIsScanning(false);
                         try {
-                          const data = JSON.parse(result[0].rawValue);
-                          if (data.tokenId) {
-                            setIsScanning(false);
-                            setTokenId(data.tokenId);
-                            handleScan(null, data.tokenId);
-                          }
-                        } catch (err) {
-                          console.error("Invalid QR code:", err);
+                          const packet = parseTicketQr(result[0].rawValue, getDeployments);
+                          setTokenId(packet.tokenId);
+                          handleScan(null, packet);
+                        } catch (error) {
+                          setScanStatus("INVALID"); setTicketDetails(null); setScanError(error.message);
                         }
                       }
                     }}
@@ -260,6 +209,7 @@ const GatekeeperTerminal = ({ walletAddress, wallet, connectWallet }) => {
               <div className="h-px flex-1 bg-white/10" />
             </div>
 
+            {scanError && <p role="alert" className="text-sm text-red-300 mb-4">{scanError}</p>}
             <form onSubmit={handleScan} className="space-y-4">
               <div className="relative">
                 <Hash className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-600" size={20} />
@@ -273,7 +223,7 @@ const GatekeeperTerminal = ({ walletAddress, wallet, connectWallet }) => {
               </div>
               <button
                 type="submit"
-                disabled={loading || !walletAddress}
+                disabled={loading || admitting || !walletAddress}
                 className="w-full py-4 bg-gradient-to-r from-indigo-500 to-violet-600 hover:from-indigo-400 hover:to-violet-500 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-2xl font-bold text-base shadow-lg shadow-indigo-900/40 transition-all flex items-center justify-center gap-2.5 active:scale-[0.99]"
               >
                 {loading ? <RefreshCw className="animate-spin" size={20} /> : <Search size={20} />}
@@ -313,6 +263,7 @@ const GatekeeperTerminal = ({ walletAddress, wallet, connectWallet }) => {
                     </div>
                     <button
                       onClick={handleUseTicket}
+                          disabled={admitting}
                       className="w-full py-4 bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-white rounded-2xl font-black text-lg shadow-lg shadow-emerald-900/40 active:scale-[0.99] transition-all flex items-center justify-center gap-2.5"
                     >
                       <DoorOpen size={22} /> Admit & void ticket
@@ -367,8 +318,8 @@ const GatekeeperTerminal = ({ walletAddress, wallet, connectWallet }) => {
                     <div className="inline-flex p-5 rounded-full bg-slate-700/60 text-slate-300">
                       <ShieldCheck size={48} />
                     </div>
-                    <h2 className="text-2xl font-black text-slate-300 tracking-tight">Invalid token</h2>
-                    <p className="text-slate-500 text-sm max-w-xs mx-auto">No ticket with this ID exists on the current ledger. Double-check the QR or ID.</p>
+                    <h2 className="text-2xl font-black text-slate-300 tracking-tight">Entry not verified</h2>
+                    <p className="text-slate-500 text-sm max-w-xs mx-auto">{scanError || "Double-check the QR or token ID and try again."}</p>
                   </div>
                 )}
 

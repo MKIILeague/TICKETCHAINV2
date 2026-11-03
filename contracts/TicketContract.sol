@@ -20,6 +20,8 @@ contract TicketContract is ERC721URIStorage, Ownable, ReentrancyGuard, Pausable 
     mapping(uint256 => TicketDetails) public ticketRegistry;
     mapping(address => bool) public whitelistedOrganizers;
     mapping(address => uint256) public organizerBalances;
+    mapping(address => bool) public gatekeepers;
+    mapping(uint256 => address) public ticketOrganizers;
 
     event TicketMinted(uint256 indexed ticketId, address indexed organizer, uint256 price, string eventName);
     event TicketResaleListed(uint256 indexed ticketId, uint256 price);
@@ -27,6 +29,7 @@ contract TicketContract is ERC721URIStorage, Ownable, ReentrancyGuard, Pausable 
     event TicketUsed(uint256 indexed ticketId);
     event OrganizerWhitelisted(address indexed organizer);
     event OrganizerRevoked(address indexed organizer);
+    event GatekeeperUpdated(address indexed gatekeeper, bool allowed);
 
     modifier onlyWhitelistedOrganizer() {
         require(whitelistedOrganizers[msg.sender], "Not a whitelisted organizer");
@@ -35,8 +38,6 @@ contract TicketContract is ERC721URIStorage, Ownable, ReentrancyGuard, Pausable 
 
     constructor() ERC721("TicketchainToken", "TKT") Ownable(msg.sender) {
         whitelistedOrganizers[msg.sender] = true;
-        // Whitelist Hardhat Account 2 by default for easier local testing
-        whitelistedOrganizers[0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC] = true;
     }
 
     function pause() public onlyOwner {
@@ -61,6 +62,12 @@ contract TicketContract is ERC721URIStorage, Ownable, ReentrancyGuard, Pausable 
         return _tokenIds;
     }
 
+    function setGatekeeper(address gatekeeper, bool allowed) public onlyOwner {
+        require(gatekeeper != address(0), "Invalid gatekeeper");
+        gatekeepers[gatekeeper] = allowed;
+        emit GatekeeperUpdated(gatekeeper, allowed);
+    }
+
     function mintTicket(
         address buyer, 
         string memory tokenURI, 
@@ -72,6 +79,7 @@ contract TicketContract is ERC721URIStorage, Ownable, ReentrancyGuard, Pausable 
 
         _mint(buyer, newTicketId);
         _setTokenURI(newTicketId, tokenURI);
+        ticketOrganizers[newTicketId] = msg.sender;
 
         // Auto-list on mint so primary tickets appear in the marketplace
         ticketRegistry[newTicketId] = TicketDetails({
@@ -103,6 +111,7 @@ contract TicketContract is ERC721URIStorage, Ownable, ReentrancyGuard, Pausable 
 
             _mint(buyer, newTicketId);
             _setTokenURI(newTicketId, tokenURI);
+            ticketOrganizers[newTicketId] = msg.sender;
 
             // Auto-list on mint so primary tickets appear in the marketplace
             ticketRegistry[newTicketId] = TicketDetails({
@@ -130,8 +139,8 @@ contract TicketContract is ERC721URIStorage, Ownable, ReentrancyGuard, Pausable 
         require(success, "Transfer failed");
     }
 
-    function cancelEventAndRefund(string memory eventName) public onlyWhitelistedOrganizer whenNotPaused {
-        // Placeholder for role matrix
+    function cancelEventAndRefund(string memory /* eventName */) public view onlyWhitelistedOrganizer whenNotPaused {
+        revert("Refunds unavailable in simulated payment mode");
     }
 
     function listTicketForResale(uint256 ticketId, uint256 price) public whenNotPaused {
@@ -156,31 +165,37 @@ contract TicketContract is ERC721URIStorage, Ownable, ReentrancyGuard, Pausable 
     }
 
     function purchaseResaleTicket(uint256 ticketId) public payable nonReentrant whenNotPaused {
+        require(msg.value == 0, "Simulated payments only; send zero ETH");
         TicketDetails storage ticket = ticketRegistry[ticketId];
         require(ticket.isForResale, "Ticket not for resale");
+        require(!ticket.isUsed, "Ticket already used");
 
         address seller = ownerOf(ticketId);
+        require(seller != msg.sender, "Cannot buy your own ticket");
+        uint256 price = ticket.resalePrice;
         ticket.isForResale = false;
         
         _transfer(seller, msg.sender, ticketId);
         
         // Zero-value ledger record: Use the original listed price for the ledger event
-        emit TicketPurchased(ticketId, msg.sender, ticket.resalePrice);
+        emit TicketPurchased(ticketId, msg.sender, price);
     }
 
     // Buy several listed tickets in a SINGLE transaction. The buyer sends the
-    // aggregate price for all requested tickets; the loop transfers each one and
-    // routes funds atomically (all-or-nothing). Any overpayment is refunded.
+    // simulated prices are recorded in events; no ticket payment ETH is accepted.
     function batchPurchaseResale(uint256[] calldata ticketIds) public payable nonReentrant whenNotPaused {
         require(ticketIds.length > 0, "No tickets specified");
+        require(msg.value == 0, "Simulated payments only; send zero ETH");
 
         for (uint256 i = 0; i < ticketIds.length; i++) {
             uint256 ticketId = ticketIds[i];
             TicketDetails storage ticket = ticketRegistry[ticketId];
             require(ticket.isForResale, "Ticket not for resale");
+            require(!ticket.isUsed, "Ticket already used");
             
             uint256 price = ticket.resalePrice;
             address seller = ownerOf(ticketId);
+            require(seller != msg.sender, "Cannot buy your own ticket");
 
             ticket.isForResale = false;
             _transfer(seller, msg.sender, ticketId);
@@ -191,12 +206,34 @@ contract TicketContract is ERC721URIStorage, Ownable, ReentrancyGuard, Pausable 
     }
 
     function useTicket(uint256 ticketId) public whenNotPaused {
+        ownerOf(ticketId); // Reject nonexistent IDs before touching the registry.
+        require(
+            msg.sender == owner() || gatekeepers[msg.sender] ||
+            (msg.sender == ticketOrganizers[ticketId] && whitelistedOrganizers[msg.sender]),
+            "Not authorized to check in tickets"
+        );
         require(!ticketRegistry[ticketId].isUsed, "Ticket already used");
         ticketRegistry[ticketId].isUsed = true;
+        ticketRegistry[ticketId].isForResale = false;
+        ticketRegistry[ticketId].resalePrice = 0;
         emit TicketUsed(ticketId);
     }
 
     function getTicketDetails(uint256 ticketId) public view returns (TicketDetails memory) {
+        ownerOf(ticketId);
         return ticketRegistry[ticketId];
+    }
+
+    // Standard ERC-721 transfers must respect pause/entry state too. A listing
+    // belongs to its seller and must never survive a gift to a different wallet.
+    function _update(address to, uint256 tokenId, address auth) internal override whenNotPaused returns (address) {
+        address from = _ownerOf(tokenId);
+        if (from != address(0)) require(!ticketRegistry[tokenId].isUsed, "Ticket already used");
+        address previous = super._update(to, tokenId, auth);
+        if (previous != address(0)) {
+            ticketRegistry[tokenId].isForResale = false;
+            ticketRegistry[tokenId].resalePrice = 0;
+        }
+        return previous;
     }
 }

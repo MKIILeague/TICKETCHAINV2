@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from "react";
+import { cloneElement, useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { useNavigate, Navigate } from "react-router-dom";
 import { ethers } from "ethers";
 import {
@@ -20,6 +20,12 @@ import { rm, ethLabel } from "./currency";
 import EventWizard from "./EventWizard";
 
 // ─── Registration Form ────────────────────────────────────────────────────────
+const Card = ({ children }) => (
+  <div className="min-h-screen bg-slate-100 flex items-center justify-center p-6">
+    <div className="max-w-md w-full text-center p-8 bg-white border border-slate-200 rounded-2xl shadow-sm">{children}</div>
+  </div>
+);
+
 const RegistrationForm = ({ walletAddress, onSubmitted }) => {
   const { user } = usePrivy();
   const [form, setForm] = useState({
@@ -215,6 +221,8 @@ const RejectedScreen = ({ orgData }) => (
 // ─── Main Organiser Dashboard ─────────────────────────────────────────────────
 const OrganizerDashboard = ({ walletAddress, wallet, connectWallet, logout, mode = "dashboard", authenticated = false, ready = true }) => {
   const navigate = useNavigate();
+  const walletRef = useRef(wallet);
+  useEffect(() => { walletRef.current = wallet; }, [wallet]);
   // Seed from the shared cache so navigating in from the navbar renders the
   // dashboard immediately instead of flashing "loading" and bouncing to login.
   const [orgStatus, setOrgStatus] = useState(() => getCachedOrgStatus(walletAddress)?.status ?? "loading"); // loading, unregistered, pending, rejected, approved
@@ -226,8 +234,6 @@ const OrganizerDashboard = ({ walletAddress, wallet, connectWallet, logout, mode
   // Existing dashboard states
   const [isPaused, setIsPaused] = useState(false);
   const [totalRevenue, setTotalRevenue] = useState("0.0");
-  const [deployedStock, setDeployedStock] = useState(0);
-  const [voidedCount, setVoidedCount] = useState(0);
   const [tickets, setTickets] = useState([]);
   // Sales timeline — one point per on-chain TicketPurchased for this organizer's
   // tickets: { id, price (ETH), t (unix seconds) }. Powers the overview graph.
@@ -240,7 +246,6 @@ const OrganizerDashboard = ({ walletAddress, wallet, connectWallet, logout, mode
   // "Active events" should mean events actually on sale, not the full history.
   const [eventFilter, setEventFilter] = useState("live");
   const [withdrawLoading, setWithdrawLoading] = useState(false);
-  const [voidingTickets, setVoidingTickets] = useState({});
   const [activeChainId, setActiveChainId] = useState(11155111);
   const [localhostFaucetLoading, setLocalhostFaucetLoading] = useState(false);
   // Firestore "approved" is only the UI signal — the contract whitelist is the
@@ -333,7 +338,7 @@ const OrganizerDashboard = ({ walletAddress, wallet, connectWallet, logout, mode
   };
 
   // ── Check Firestore for organiser record (shared cache + revalidate) ──
-  const checkOrgStatus = async () => {
+  const checkOrgStatus = useCallback(async () => {
     if (!walletAddress) return;
     // Show the cached status (if any) while we revalidate, so we never flash a
     // spinner or bounce an already-approved organizer to the login screen.
@@ -351,11 +356,11 @@ const OrganizerDashboard = ({ walletAddress, wallet, connectWallet, logout, mode
       // isn't told to re-register. If we already have a cached status, keep it.
       if (!cached) setOrgStatus("error");
     }
-  };
+  }, [walletAddress]);
 
   useEffect(() => {
-    checkOrgStatus();
-  }, [walletAddress]);
+    void Promise.resolve().then(checkOrgStatus);
+  }, [checkOrgStatus]);
 
   // While the application is pending, listen to the organiser doc live so an
   // admin approval flips this screen into the dashboard without a manual reload.
@@ -376,7 +381,8 @@ const OrganizerDashboard = ({ walletAddress, wallet, connectWallet, logout, mode
     return unsub;
   }, [walletAddress, orgStatus]);
 
-  const fetchDashboardData = async () => {
+  const fetchDashboardData = useCallback(async () => {
+    const wallet = walletRef.current;
     if (!walletAddress) return;
 
     // A) Off-chain events + sold counters FIRST and independently. This powers
@@ -500,23 +506,21 @@ const OrganizerDashboard = ({ walletAddress, wallet, connectWallet, logout, mode
       }
 
       setTickets(allTickets);
-      setDeployedStock(allTickets.length);
-      setVoidedCount(allTickets.filter((t) => t.isUsed).length);
       allSales.sort((a, b) => (a.t - b.t) || (Number(a.id) - Number(b.id)));
       setSalesSeries(allSales);
     } catch (error) {
       console.error("Dashboard on-chain sync error:", error);
     }
-  };
+  }, [walletAddress]);
 
   useEffect(() => {
     if (orgStatus === "approved" && walletAddress) {
-      fetchDashboardData();
+      void Promise.resolve().then(fetchDashboardData);
     }
-  }, [orgStatus, walletAddress]);
+  }, [orgStatus, walletAddress, fetchDashboardData]);
 
   // ── Staff management (Firestore: staff/{email}) ──
-  const loadStaff = async () => {
+  const loadStaff = useCallback(async () => {
     if (!walletAddress) return;
     setStaffLoading(true);
     try {
@@ -528,13 +532,13 @@ const OrganizerDashboard = ({ walletAddress, wallet, connectWallet, logout, mode
     } finally {
       setStaffLoading(false);
     }
-  };
+  }, [walletAddress]);
 
   useEffect(() => {
     if (orgStatus === "approved" && walletAddress) {
-      loadStaff();
+      void Promise.resolve().then(loadStaff);
     }
-  }, [orgStatus, walletAddress]);
+  }, [orgStatus, walletAddress, loadStaff]);
 
   const addStaff = async (e) => {
     e?.preventDefault?.();
@@ -645,62 +649,6 @@ const OrganizerDashboard = ({ walletAddress, wallet, connectWallet, logout, mode
     }
   };
 
-  const handleVoidTicket = async (id) => {
-    if (!wallet || voidingTickets[id]) return;
-    try {
-      setVoidingTickets(prev => ({ ...prev, [id]: true }));
-      let eip1193Provider = await wallet.getEthereumProvider();
-      let provider = new ethers.BrowserProvider(eip1193Provider);
-
-      const network = await provider.getNetwork();
-      const currentChainId = Number(network.chainId);
-      const targetChainId = (currentChainId === 31337 || currentChainId === 11155111) ? currentChainId : 11155111;
-
-      if (currentChainId !== targetChainId) {
-        await wallet.switchChain(targetChainId);
-        eip1193Provider = await wallet.getEthereumProvider();
-        provider = new ethers.BrowserProvider(eip1193Provider);
-      }
-
-      const signer = await provider.getSigner();
-      const contractAddress = getContractAddress(targetChainId);
-      const contract = new ethers.Contract(contractAddress, CONTRACT_ABI, signer);
-
-      // Pre-flight gas check
-      const balance = await provider.getBalance(walletAddress);
-      const balanceInEth = parseFloat(ethers.formatEther(balance));
-
-      let estimatedCost = 0.0002; // Safe fallback
-      try {
-        const feeData = await provider.getFeeData();
-        const gasPrice = feeData.gasPrice || ethers.parseUnits("3", "gwei");
-        const estimatedGas = await contract.useTicket.estimateGas(id);
-        const totalGasLimit = (estimatedGas * 120n) / 100n;
-        estimatedCost = parseFloat(ethers.formatEther(totalGasLimit * gasPrice));
-      } catch (estErr) {
-        console.warn("Dynamic estimation failed, using fallback:", estErr);
-        const fallbackGas = 80000n; // Safe fallback gas
-        const fallbackGasPrice = 3000000000n; // 3 Gwei
-        estimatedCost = parseFloat(ethers.formatEther(fallbackGas * fallbackGasPrice));
-      }
-
-      if (balanceInEth < estimatedCost) {
-        alert(`❌ Insufficient funds for gas!\n\nYou currently have ${balanceInEth.toFixed(4)} ETH, but you need at least ${estimatedCost.toFixed(4)} ETH to send this transaction.\n\nPlease fund your wallet before trying again.`);
-        setVoidingTickets(prev => ({ ...prev, [id]: false }));
-        return;
-      }
-
-      const tx = await contract.useTicket(id);
-      await tx.wait();
-      alert(`Ticket #${id} voided!`);
-      fetchDashboardData();
-    } catch (error) {
-      console.error("Voiding failed:", error);
-      alert(error.reason || error.message || "Transaction failed");
-    } finally {
-      setVoidingTickets(prev => ({ ...prev, [id]: false }));
-    }
-  };
 
   // Group individual ticket tokens into events and compute sales statistics.
   // A ticket is "sold" once it leaves the organizer's wallet (bought by someone);
@@ -804,12 +752,6 @@ const OrganizerDashboard = ({ walletAddress, wallet, connectWallet, logout, mode
     return pts.sort((a, b) => a.t - b.t);
   }, [salesSeries, eventDocs]);
 
-  // Small centered card wrapper used by the organizer auth/status screens.
-  const Card = ({ children }) => (
-    <div className="min-h-screen bg-slate-100 flex items-center justify-center p-6">
-      <div className="max-w-md w-full text-center p-8 bg-white border border-slate-200 rounded-2xl shadow-sm">{children}</div>
-    </div>
-  );
 
   // While Privy boots or the embedded wallet address resolves for an already
   // signed-in user, show a spinner instead of flashing the sign-in card.
@@ -1351,7 +1293,7 @@ const StatCard = ({ icon, label, value, sub, color }) => {
   return (
     <div className="bg-white border border-slate-200 p-6 rounded-2xl shadow-sm flex items-center gap-5">
       <div className={`w-12 h-12 rounded-xl flex items-center justify-center shrink-0 ${tones[color] || tones.indigo}`}>
-        {React.cloneElement(icon, { size: 22 })}
+        {cloneElement(icon, { size: 22 })}
       </div>
       <div className="min-w-0">
         <p className="text-slate-500 text-sm">{label}</p>

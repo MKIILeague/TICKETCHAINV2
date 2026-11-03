@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { ethers } from "ethers";
 import {
   ShieldAlert, UserMinus, Activity,
@@ -8,6 +8,7 @@ import {
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { CONTRACT_ABI, getContractAddress } from "./constants";
+import { getAdminContract } from "./chainAccess";
 import { db } from "./firebase";
 import {
   collection, getDocs, doc, updateDoc, serverTimestamp, query, orderBy
@@ -64,6 +65,11 @@ const ToastStack = ({ toasts, dismiss }) => {
 };
 
 const SystemAdminConsole = ({ walletAddress, wallet, connectWallet }) => {
+  const walletRef = useRef(wallet);
+  useEffect(() => { walletRef.current = wallet; }, [wallet]);
+  const [gatekeeperAddress, setGatekeeperAddress] = useState("");
+  const [gatekeeperBusy, setGatekeeperBusy] = useState(false);
+  const [supportsGatekeepers, setSupportsGatekeepers] = useState(null);
   const [isPaused, setIsPaused] = useState(false);
   const [loading, setLoading] = useState(false);
   const [organisers, setOrganisers] = useState([]);
@@ -79,7 +85,7 @@ const SystemAdminConsole = ({ walletAddress, wallet, connectWallet }) => {
   const { toasts, push, dismiss } = useToasts();
 
   // ── Fetch Firestore organisers ──
-  const fetchOrganisers = async () => {
+  const fetchOrganisers = useCallback(async () => {
     try {
       const q = query(collection(db, "organisers"), orderBy("submittedAt", "desc"));
       const snap = await getDocs(q);
@@ -89,10 +95,11 @@ const SystemAdminConsole = ({ walletAddress, wallet, connectWallet }) => {
       console.error("Firestore fetch failed:", err);
       push("error", "Failed to load organiser applications.");
     }
-  };
+  }, [push]);
 
   // ── Fetch on-chain data ──
-  const fetchChainData = async () => {
+  const fetchChainData = useCallback(async () => {
+    const wallet = walletRef.current;
     if (!wallet || !walletAddress) return;
     try {
       const eip1193Provider = await wallet.getEthereumProvider();
@@ -103,12 +110,14 @@ const SystemAdminConsole = ({ walletAddress, wallet, connectWallet }) => {
       const contract = new ethers.Contract(contractAddress, CONTRACT_ABI, provider);
       const paused = await contract.paused();
       setIsPaused(paused);
+      try { await contract.gatekeepers(walletAddress); setSupportsGatekeepers(true); }
+      catch { setSupportsGatekeepers(false); }
       const balance = await provider.getBalance(contractAddress);
       setPlatformBalance(ethers.formatEther(balance));
     } catch (err) {
       console.error("Chain fetch error:", err);
     }
-  };
+  }, [walletAddress]);
 
   // ── Combined refresh (used on mount + manual button) ──
   const refreshAll = useCallback(async ({ silent = false } = {}) => {
@@ -117,13 +126,12 @@ const SystemAdminConsole = ({ walletAddress, wallet, connectWallet }) => {
     setLastUpdated(new Date());
     setRefreshing(false);
     setInitialLoading(false);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [walletAddress]);
+  }, [fetchOrganisers, fetchChainData]);
 
   // Depend on the stable address string, not the `wallet` object (its identity
   // changes every render, which caused an infinite fetch/abort loop).
   useEffect(() => {
-    refreshAll({ silent: true });
+    void Promise.resolve().then(() => refreshAll({ silent: true }));
   }, [walletAddress, refreshAll]);
 
   // ── Approve: Firestore + on-chain whitelist ──
@@ -137,13 +145,7 @@ const SystemAdminConsole = ({ walletAddress, wallet, connectWallet }) => {
       }
 
       // Whitelist organizer on-chain first
-      const eip1193Provider = await wallet.getEthereumProvider();
-      const provider = new ethers.BrowserProvider(eip1193Provider);
-      const network = await provider.getNetwork();
-      const currentChainId = Number(network.chainId);
-      const contractAddress = getContractAddress(currentChainId);
-      const signer = await provider.getSigner();
-      const contract = new ethers.Contract(contractAddress, CONTRACT_ABI, signer);
+      const contract = await getAdminContract(wallet);
 
       const tx = await contract.whitelistOrganizer(org.id);
       await tx.wait();
@@ -174,13 +176,7 @@ const SystemAdminConsole = ({ walletAddress, wallet, connectWallet }) => {
         setActionLoading(null);
         return;
       }
-      const eip1193Provider = await wallet.getEthereumProvider();
-      const provider = new ethers.BrowserProvider(eip1193Provider);
-      const network = await provider.getNetwork();
-      const currentChainId = Number(network.chainId);
-      const contractAddress = getContractAddress(currentChainId);
-      const signer = await provider.getSigner();
-      const contract = new ethers.Contract(contractAddress, CONTRACT_ABI, signer);
+      const contract = await getAdminContract(wallet);
 
       const tx = await contract.whitelistOrganizer(org.id);
       await tx.wait();
@@ -225,13 +221,7 @@ const SystemAdminConsole = ({ walletAddress, wallet, connectWallet }) => {
       }
 
       // Revoke organizer on-chain first
-      const eip1193Provider = await wallet.getEthereumProvider();
-      const provider = new ethers.BrowserProvider(eip1193Provider);
-      const network = await provider.getNetwork();
-      const currentChainId = Number(network.chainId);
-      const contractAddress = getContractAddress(currentChainId);
-      const signer = await provider.getSigner();
-      const contract = new ethers.Contract(contractAddress, CONTRACT_ABI, signer);
+      const contract = await getAdminContract(wallet);
 
       const tx = await contract.revokeOrganizer(org.id);
       await tx.wait();
@@ -256,13 +246,7 @@ const SystemAdminConsole = ({ walletAddress, wallet, connectWallet }) => {
     if (!wallet) return;
     setLoading(true);
     try {
-      const eip1193Provider = await wallet.getEthereumProvider();
-      const provider = new ethers.BrowserProvider(eip1193Provider);
-      const network = await provider.getNetwork();
-      const currentChainId = Number(network.chainId);
-      const contractAddress = getContractAddress(currentChainId);
-      const signer = await provider.getSigner();
-      const contract = new ethers.Contract(contractAddress, CONTRACT_ABI, signer);
+      const contract = await getAdminContract(wallet);
       const tx = isPaused ? await contract.unpause() : await contract.pause();
       await tx.wait();
       setIsPaused(!isPaused);
@@ -273,6 +257,18 @@ const SystemAdminConsole = ({ walletAddress, wallet, connectWallet }) => {
     } finally {
       setLoading(false);
     }
+  };
+
+  const handleGatekeeper = async (allowed) => {
+    if (!ethers.isAddress(gatekeeperAddress)) { push("error", "Enter a valid staff wallet address."); return; }
+    setGatekeeperBusy(true);
+    try {
+      const contract = await getAdminContract(wallet);
+      const tx = await contract.setGatekeeper(gatekeeperAddress, allowed);
+      await tx.wait();
+      push("success", allowed ? "Gatekeeper authorized on-chain." : "Gatekeeper access revoked on-chain.");
+    } catch (error) { push("error", error.reason || error.shortMessage || error.message); }
+    finally { setGatekeeperBusy(false); }
   };
 
   const pending = organisers.filter(o => o.status === "pending");
@@ -328,6 +324,24 @@ const SystemAdminConsole = ({ walletAddress, wallet, connectWallet }) => {
           </div>
         </div>
       </header>
+      <section className="max-w-7xl mx-auto px-4 sm:px-8 pt-6">
+        <div className="rounded-2xl border border-slate-200 bg-white p-5">
+          <h2 className="text-sm font-semibold text-slate-900">Gatekeeper authorization</h2>
+          {supportsGatekeepers === false ? (
+            <p className="mt-2 text-sm text-amber-700">This deployment uses legacy check-in permissions. Deploy the updated contract to enforce staff wallet authorization.</p>
+          ) : (
+            <>
+              <p className="mt-1 text-xs text-slate-500">After assigning a staff email in the organizer dashboard, authorize their wallet here to record entry on-chain.</p>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <input aria-label="Gatekeeper wallet address" value={gatekeeperAddress} onChange={(e) => setGatekeeperAddress(e.target.value)} placeholder="0x..." className="min-w-0 flex-1 border border-slate-200 rounded-lg p-2 text-sm font-mono" />
+                <button disabled={gatekeeperBusy || supportsGatekeepers !== true} onClick={() => handleGatekeeper(true)} className="rounded-lg bg-indigo-600 px-4 py-2 text-sm text-white disabled:opacity-40">Authorize</button>
+                <button disabled={gatekeeperBusy || supportsGatekeepers !== true} onClick={() => handleGatekeeper(false)} className="rounded-lg border border-red-200 px-4 py-2 text-sm text-red-600 disabled:opacity-40">Revoke</button>
+              </div>
+            </>
+          )}
+        </div>
+      </section>
+
 
       <div className="max-w-7xl mx-auto p-4 sm:p-8 space-y-6 sm:space-y-8">
 

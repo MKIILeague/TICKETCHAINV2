@@ -5,7 +5,7 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 const privyAppId = process.env.PRIVY_APP_ID || 'cmpwse3mr000i0ejp1lre5fy9';
-const jwksUri = process.env.PRIVY_JWKS_URI || 'https://auth.privy.io/api/v1/apps/cmpwse3mr000i0ejp1lre5fy9/jwks.json';
+const jwksUri = process.env.PRIVY_JWKS_URI || `https://auth.privy.io/api/v1/apps/${privyAppId}/jwks.json`;
 
 // Initialize the JWKS client pointing to Privy's public keys
 const client = jwksClient({
@@ -35,7 +35,7 @@ function getKey(header, callback) {
  * It extracts the token from the Authorization header (Bearer <token>),
  * verifies its signature using the JWKS endpoint, and validates claims.
  */
-export const verifyPrivyToken = (req, res, next) => {
+export const createPrivyTokenVerifier = ({ appId = privyAppId, resolveKey = getKey } = {}) => (req, res, next) => {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     return res.status(401).json({ 
@@ -44,22 +44,23 @@ export const verifyPrivyToken = (req, res, next) => {
     });
   }
 
-  const token = authHeader.split(' ')[1];
+  const match = /^Bearer\s+(\S+)$/i.exec(authHeader);
+  if (!match) return res.status(401).json({ success: false, error: 'Invalid authorization header' });
+  const token = match[1];
 
   jwt.verify(
     token, 
-    getKey, 
+    resolveKey,
     {
       issuer: 'privy.io',
-      audience: privyAppId,
-      algorithms: ['RS256']
+      audience: appId,
+      algorithms: ['ES256']
     }, 
     (err, decoded) => {
-      if (err) {
-        console.error('Token verification failed:', err.message);
+      if (err || !decoded || typeof decoded.sub !== 'string' || !Number.isFinite(decoded.exp)) {
         return res.status(401).json({ 
           success: false, 
-          error: `Invalid token: ${err.message}` 
+          error: 'Invalid or expired access token'
         });
       }
       
@@ -70,3 +71,5 @@ export const verifyPrivyToken = (req, res, next) => {
     }
   );
 };
+
+export const verifyPrivyToken = createPrivyTokenVerifier();

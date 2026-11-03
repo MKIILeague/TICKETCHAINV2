@@ -48,7 +48,7 @@ npm run dev        # node --watch server.js
 firebase deploy --only hosting
 ```
 
-There is **no automated test suite** (no `npm test`, no Hardhat tests). Verification is manual — see `run_guide.md` for the full local and Sepolia walkthroughs.
+Automated checks are available through `npm run check` (contracts, frontend logic, lint/build, backend auth). Manual presentation verification is also required — see `run_guide.md` for the full local and Sepolia walkthroughs.
 
 ## After redeploying the contract
 
@@ -91,8 +91,8 @@ ERC721URIStorage + Ownable + ReentrancyGuard + Pausable. Solidity 0.8.24, `cancu
 - **110% anti-scalping cap**: `listTicketForResale` reverts if price > `originalPrice * 110 / 100`.
 - **Auto-list on mint**: minting sets `isForResale=true` at face value so primary tickets appear in the marketplace immediately (emits both `TicketMinted` and `TicketResaleListed`).
 - `batchMintTickets` mints `quantity` tokens in one tx (one wallet approval). The local Hardhat config sets a huge `blockGasLimit` (500M) so large batches fit in a single tx — local dev only.
-- Constructor whitelists the deployer and Hardhat account #2 (`0x3C44...`) for easy local testing.
-- Verification: `useTicket` flips `isUsed` (the gatekeeper queries live chain state then sends this tx — verification is online-only by design).
+- The constructor whitelists only the deployer. Local setup whitelists its configured organizer explicitly.
+- Verification in the updated source: `useTicket` requires the owner, issuing whitelisted organizer, or an admin-authorized gatekeeper, then flips `isUsed` (the gatekeeper queries live chain state then sends this tx — verification is online-only by design).
 
 ### Data storage
 - **Firestore** (`frontend/src/firebase.js`, project `ticketchain-1247c`) — only the `organisers/{walletAddress}` collection is actively used (onboarding status). The config is intentionally committed (public Firebase web config). Note: `initializeFirestore` uses `experimentalAutoDetectLongPolling` to survive proxies/VPNs/ad-blockers that stall the default WebChannel transport.
@@ -114,3 +114,8 @@ ERC721URIStorage + Ownable + ReentrancyGuard + Pausable. Solidity 0.8.24, `cancu
 
 
 code is the source of truth for current behavior.
+
+
+## Presentation maintenance (3 November 2026)
+
+Use `docs/PRESENTATION_STATUS.md` and `run_guide.md` for current behavior. The new contract safety logic is tested locally but has not been deployed to Sepolia. Payments remain simulated (zero ETH value); displayed prices do not create withdrawable revenue. Firestore uses events, organisers, staff and profiles. Its supplied demo rules expired on 21 September 2026; never treat Privy sign-in as Firebase authentication. The read-only preflight is `npm run check:live`.

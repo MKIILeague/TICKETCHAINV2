@@ -7,7 +7,7 @@ async function main() {
   const recipient = process.argv[2];
 
   if (!recipient || !ethers.isAddress(recipient)) {
-    console.error("❌ ERROR: Please provide a valid recipient address.\n\nUsage: nodagye scripts/send_eth.js <YOUR_WALLET_ADDRESS>\nExample: node scripts/send_eth.js 0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC");
+    console.error("❌ ERROR: Please provide a valid recipient address.\n\nUsage: node scripts/send_eth.js <YOUR_WALLET_ADDRESS>\nExample: node scripts/send_eth.js 0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC");
     process.exit(1);
   }
 

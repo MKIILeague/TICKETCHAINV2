@@ -8,9 +8,10 @@ import {
   XCircle, AlertTriangle, Wallet, ArrowDown, ArrowRight, Copy, Check, Sparkles
 } from "lucide-react";
 import { CONTRACT_ABI, PUBLIC_RPC_URL, getContractAddress, getDeployments } from "./constants";
-import { fetchPublicEventStatusMap, normalizeEventName, EVENT_STATUS } from "./eventStatus";
-import { formatEventWindow } from "./EventsHappening";
+import { fetchPublicEventStatusMap, normalizeEventName, isSaleBlocked, fetchEventStatusByName } from "./eventStatus";
+import { formatEventWindow } from "./dateFormat";
 import { ipfsToHttp } from "./ipfs";
+import { ticketKey } from "./ticketUtils";
 import { fetchProfile } from "./profileStore";
 import { rm, ethLabel } from "./currency";
 
@@ -83,7 +84,7 @@ async function getReadContext(wallet) {
     try {
       const provider = new ethers.BrowserProvider(await wallet.getEthereumProvider());
       const chainId = Number((await provider.getNetwork()).chainId);
-      if (chainId === 31337) return { provider, chainId }; // local Hardhat node only
+      if (import.meta.env.DEV && chainId === 31337) return { provider, chainId }; // local Hardhat node only
     } catch { /* fall through to public RPC */ }
   }
   // batchMaxCount:1 — drpc's free tier rejects batched eth_call, which silently
@@ -163,6 +164,8 @@ const txUrl = (chainId, hash) => {
  */
 export default function ResaleMarketplace({ walletAddress, wallet, connectWallet }) {
   const navigate = useNavigate();
+  const walletRef = useRef(wallet);
+  useEffect(() => { walletRef.current = wallet; }, [wallet]);
   const [listings, setListings] = useState([]);
   const [loading, setLoading] = useState(true);
   const [buyingId, setBuyingId] = useState(null);
@@ -183,10 +186,14 @@ export default function ResaleMarketplace({ walletAddress, wallet, connectWallet
       // always shows the actually-published event's venue/time, not whichever
       // same-named draft/duplicate doc happened to load first.
       const [{ provider, chainId }, eventStatusMap] = await Promise.all([
-        getReadContext(wallet),
+        getReadContext(walletRef.current),
         fetchPublicEventStatusMap(),
       ]);
-      const contractAddress = getContractAddress(chainId);
+      const allRows = [];
+      let successfulDeployments = 0;
+      for (const deployment of getDeployments(chainId)) {
+      try {
+      const contractAddress = deployment.address;
       setChainInfo({ chainId, contractAddress });
       const contract = new ethers.Contract(contractAddress, CONTRACT_ABI, provider);
       const iface = contract.interface;
@@ -260,6 +267,8 @@ export default function ResaleMarketplace({ walletAddress, wallet, connectWallet
         const meta = entry?.ev || null;
         return {
           id: id.toString(),
+          contractAddress,
+          chainId,
           eventTitle,
           owner,
           // Carried so the authenticity popup can warn on a canceled event —
@@ -274,6 +283,13 @@ export default function ResaleMarketplace({ walletAddress, wallet, connectWallet
           category: meta?.category || "",
         };
       });
+
+      allRows.push(...rows.filter((r) => !isSaleBlocked(r.eventStatus)));
+      successfulDeployments++;
+      } catch (deploymentError) { console.warn("Resale deployment scan failed:", deployment.address, deploymentError); }
+      }
+      if (!successfulDeployments) throw new Error("Could not read any ticket deployment");
+      const rows = allRows;
 
       // Attach seller display names from saved profiles (profiles/{address}),
       // so cards read "Sold by Syed" instead of a raw 0x… address. Cached + deduped
@@ -297,20 +313,21 @@ export default function ResaleMarketplace({ walletAddress, wallet, connectWallet
     } finally {
       setLoading(false);
     }
-  }, [wallet]);
+  }, []);
 
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => { void Promise.resolve().then(load); }, [load, walletAddress]);
 
   const handleBuy = async (listing) => {
     if (!wallet || !walletAddress) { connectWallet?.(); return; }
     if (listing.owner.toLowerCase() === walletAddress.toLowerCase()) return; // can't buy your own
-    setBuyingId(listing.id);
+    setBuyingId(ticketKey(listing));
     setError("");
     try {
+      if (isSaleBlocked(await fetchEventStatusByName(listing.eventTitle, { strict: true }))) throw new Error("This event is no longer on sale.");
       let eip = await wallet.getEthereumProvider();
       let provider = new ethers.BrowserProvider(eip);
       const currentChainId = Number((await provider.getNetwork()).chainId);
-      const targetChainId = (currentChainId === 31337 || currentChainId === 11155111) ? currentChainId : 11155111;
+      const targetChainId = listing.chainId;
       if (currentChainId !== targetChainId) {
         await wallet.switchChain(targetChainId);
         eip = await wallet.getEthereumProvider();
@@ -326,7 +343,11 @@ export default function ResaleMarketplace({ walletAddress, wallet, connectWallet
       }
 
       const signer = await provider.getSigner();
-      const contract = new ethers.Contract(getContractAddress(targetChainId), CONTRACT_ABI, signer);
+      const contract = new ethers.Contract(listing.contractAddress, CONTRACT_ABI, signer);
+      const currentOwner = await contract.ownerOf(listing.id);
+      if (currentOwner.toLowerCase() !== listing.owner.toLowerCase()) throw new Error("The seller has changed. Refresh the listings.");
+      const details = await contract.getTicketDetails(listing.id);
+      if (details.isUsed || !details.isForResale) throw new Error("This ticket is no longer available.");
       const tx = await contract.purchaseResaleTicket(listing.id, { value: 0n });
       await tx.wait();
 
@@ -420,10 +441,10 @@ export default function ResaleMarketplace({ walletAddress, wallet, connectWallet
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
           {filtered.map((l) => (
             <ResaleCard
-              key={l.id}
+              key={ticketKey(l)}
               listing={l}
               isOwn={walletAddress && l.owner.toLowerCase() === walletAddress.toLowerCase()}
-              buying={buyingId === l.id}
+              buying={buyingId === ticketKey(l)}
               disabled={!!buyingId}
               onBuy={() => handleBuy(l)}
               onInspect={() => setDetailListing(l)}
@@ -438,8 +459,8 @@ export default function ResaleMarketplace({ walletAddress, wallet, connectWallet
             key="ownership"
             listing={detailListing}
             wallet={wallet}
-            chainId={chainInfo.chainId}
-            contractAddress={chainInfo.contractAddress}
+            chainId={detailListing.chainId || chainInfo.chainId}
+            contractAddress={detailListing.contractAddress || chainInfo.contractAddress}
             isOwn={walletAddress && detailListing.owner.toLowerCase() === walletAddress.toLowerCase()}
             buying={buyingId === detailListing.id}
             disabled={!!buyingId}
@@ -676,7 +697,7 @@ const OwnershipModal = ({
 
         // Full transfer history for THIS token id (tokenId is an indexed ERC-721
         // Transfer arg, so each window is a cheap filtered log query).
-        const startBlock = getDeployments(chainId)[0]?.startBlock ?? 0;
+        const startBlock = getDeployments(chainId).find((d) => d.address.toLowerCase() === contractAddress.toLowerCase())?.startBlock ?? 0;
         let logs = [];
         try {
           logs = await fetchTransferHistory(provider, contract, listing.id, startBlock);
@@ -747,7 +768,7 @@ const OwnershipModal = ({
     // 110% cap compared in wei — floats drift at this precision.
     const capWei = (live.originalWei * 110n) / 100n;
     const withinCap = live.resaleWei <= capWei;
-    const canceled = listing.eventStatus === EVENT_STATUS.CANCELED;
+    const canceled = isSaleBlocked(listing.eventStatus);
 
     checks.push({
       state: "pass",

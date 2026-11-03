@@ -1,24 +1,26 @@
-import React, { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { useParams, useNavigate, Link } from "react-router-dom";
 import { ethers } from "ethers";
 import {
   MapPin, Clock, Ticket, ArrowLeft, RefreshCw, ShieldCheck, Ban,
-  CalendarX, AlertCircle, CheckCircle2, Tag, Minus, Plus
+  CalendarX, AlertCircle, Tag, Minus, Plus
 } from "lucide-react";
 import { doc, onSnapshot, updateDoc, increment } from "firebase/firestore";
 import { db } from "./firebase";
-import { CONTRACT_ABI, START_BLOCK, getContractAddress } from "./constants";
+import { CONTRACT_ABI, getDeployments, getContractAddress } from "./constants";
 import { EVENT_STATUS, effectiveStatus, isSaleBlocked } from "./eventStatus";
 import { ipfsToHttp } from "./ipfs";
-import { formatEventWindow } from "./EventsHappening";
+import { formatEventWindow } from "./dateFormat";
 
+import { queryTicketLogs } from "./ticketUtils";
 import { rm, ethLabel } from "./currency";
 
 /**
  * Single-event checkout (route /event/:eventId) with multi-quantity purchase.
  *
  * The deployed contract sells the organiser's auto-listed primary tickets one at
- * a time via purchaseResaleTicket(ticketId). There's no buyer-facing batch-mint,
+ * a time via purchaseResaleTicket(ticketId), or atomically with batchPurchaseResale.
+ * There is no buyer-facing batch-mint,
  * so buying N tickets = N purchaseResaleTicket calls (N wallet approvals) against
  * N distinct available token IDs. Inventory is tracked off-chain via the
  * Firestore `sold` counter (aggregateSupply - sold = remaining).
@@ -31,7 +33,7 @@ export default function EventCheckout({ walletAddress, wallet, connectWallet }) 
   const [loading, setLoading] = useState(true);
   const [notFound, setNotFound] = useState(false);
 
-  const [qty, setQty] = useState(1);
+  const [requestedQty, setQty] = useState(1);
   const [phase, setPhase] = useState("idle"); // idle | buying | done
   const [progress, setProgress] = useState({ current: 0, total: 0 });
   const [error, setError] = useState("");
@@ -41,7 +43,8 @@ export default function EventCheckout({ walletAddress, wallet, connectWallet }) 
     const unsub = onSnapshot(
       doc(db, "events", eventId),
       (snap) => {
-        if (!snap.exists()) { setNotFound(true); setLoading(false); return; }
+        if (!snap.exists()) { setEv(null); setNotFound(true); setLoading(false); return; }
+        setNotFound(false);
         setEv({ id: snap.id, ...snap.data() });
         setLoading(false);
       },
@@ -59,10 +62,7 @@ export default function EventCheckout({ walletAddress, wallet, connectWallet }) 
   const price = Number(ev?.priceEth) || 0;
   const totalCost = price * qty;
 
-  // Keep the chosen quantity within [1, remaining] as inventory changes live.
-  useEffect(() => {
-    setQty((q) => Math.min(Math.max(1, q), Math.max(1, remaining)));
-  }, [remaining]);
+  const qty = Math.min(Math.max(1, requestedQty), Math.max(1, remaining));
 
   const exceedsStock = qty > remaining;
 
@@ -78,29 +78,30 @@ export default function EventCheckout({ walletAddress, wallet, connectWallet }) 
     const network = await provider.getNetwork();
     const chainId = Number(network.chainId);
     const contract = new ethers.Contract(contractAddressFor(chainId), CONTRACT_ABI, provider);
-    const startBlock = chainId === 11155111 ? START_BLOCK : 0;
-
-    let logs;
-    try {
-      logs = await contract.queryFilter(contract.filters.TicketMinted(), startBlock);
-    } catch {
-      logs = await contract.queryFilter(contract.filters.TicketMinted(), 0); // some RPCs cap block ranges
-    }
+    const deployment = getDeployments(chainId).find((d) => d.address.toLowerCase() === contractAddressFor(chainId).toLowerCase());
+    const startBlock = evt.mintBlock || deployment?.startBlock || 0;
+    const logs = await queryTicketLogs(contract, contract.filters.TicketMinted(null, evt.organiserId), startBlock);
+    const eventIds = evt.ticketIds ? new Set(evt.ticketIds.map(String)) : null;
 
     const wantName = (evt.headline || "").trim();
     const list = [];
     for (const log of logs) {
+      if ((log.args[3] || "").trim() !== wantName) continue;
       try {
         const id = log.args[0];
+        if (eventIds && !eventIds.has(String(id))) continue;
         const details = await contract.getTicketDetails(id);
         if ((details.eventName || "").trim() !== wantName) continue;
         if (!details.isForResale || details.isUsed) continue;
+        const owner = await contract.ownerOf(id);
+        if (owner.toLowerCase() !== evt.organiserId.toLowerCase()) continue;
+        if (owner.toLowerCase() === walletAddress?.toLowerCase()) continue;
         list.push({ id: id.toString(), price: details.resalePrice });
       } catch { /* skip unreadable token */ }
     }
     list.sort((a, b) => (a.price < b.price ? -1 : a.price > b.price ? 1 : 0));
     return list;
-  }, [contractAddressFor]);
+  }, [contractAddressFor, walletAddress]);
 
   const handleBuy = async () => {
     if (phase === "buying") return;
@@ -139,9 +140,7 @@ export default function EventCheckout({ walletAddress, wallet, connectWallet }) 
       }
       const picks = available.slice(0, qty);
 
-      // Funds check: sum of the ticket prices + a per-ticket gas buffer.
       // Demo mode: transactions execute with zero value, so we only need a gas buffer.
-      const sumWei = picks.reduce((acc, p) => acc + p.price, 0n);
       const gasBufferWei = ethers.parseEther((0.0005 * qty).toFixed(6));
       const need = gasBufferWei; // Only require gas, not the ticket price
       const balance = await provider.getBalance(walletAddress);
@@ -181,14 +180,17 @@ export default function EventCheckout({ walletAddress, wallet, connectWallet }) 
         }
       }
 
-      // Atomically bump the off-chain sold counter by however many succeeded.
-      await updateDoc(doc(db, "events", ev.id), {
-        sold: increment(purchased),
-        updatedAt: new Date().toISOString(),
-      });
-
+      // Ownership is already confirmed. A failed database update must never be
+      // reported as a failed chain purchase or retried as a second purchase.
+      let syncWarning = "";
+      try {
+        await updateDoc(doc(db, "events", ev.id), { sold: increment(purchased), updatedAt: new Date().toISOString() });
+      } catch (syncError) {
+        console.warn("Purchase confirmed; inventory sync failed:", syncError);
+        syncWarning = "Your purchase is confirmed on-chain. The event's inventory counter could not be updated.";
+      }
       setPhase("done");
-      navigate("/wallet", { state: { purchased, eventTitle: ev.headline } });
+      navigate("/wallet", { state: { purchased, eventTitle: ev.headline, syncWarning } });
     } catch (err) {
       console.error("Purchase failed:", err);
       const reason = err?.reason || err?.data?.message || err?.message || "Transaction failed";
@@ -310,7 +312,7 @@ export default function EventCheckout({ walletAddress, wallet, connectWallet }) 
                 <span className="text-sm font-medium text-slate-700">Quantity</span>
                 <div className="inline-flex items-center rounded-xl border border-slate-200 bg-white overflow-hidden">
                   <button
-                    onClick={() => setQty((q) => Math.max(1, q - 1))}
+                    onClick={() => setQty(Math.max(1, qty - 1))}
                     disabled={buying || qty <= 1}
                     className="px-3.5 py-2.5 text-slate-600 hover:bg-slate-50 disabled:text-slate-300 disabled:hover:bg-white transition-colors"
                     aria-label="Decrease quantity"
@@ -319,7 +321,7 @@ export default function EventCheckout({ walletAddress, wallet, connectWallet }) 
                   </button>
                   <span className="w-12 text-center font-semibold text-slate-900 tabular-nums">{qty}</span>
                   <button
-                    onClick={() => setQty((q) => Math.min(remaining, q + 1))}
+                    onClick={() => setQty(Math.min(remaining, qty + 1))}
                     disabled={buying || qty >= remaining}
                     className="px-3.5 py-2.5 text-slate-600 hover:bg-slate-50 disabled:text-slate-300 disabled:hover:bg-white transition-colors"
                     aria-label="Increase quantity"

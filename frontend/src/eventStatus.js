@@ -46,7 +46,8 @@ export function effectiveStatus(ev, now = Date.now()) {
 
 /** True if buying / minting / entry should be blocked for this state. */
 export const isSaleBlocked = (status) =>
-  status === EVENT_STATUS.CANCELED || status === EVENT_STATUS.FINISHED;
+  status === EVENT_STATUS.CANCELED || status === EVENT_STATUS.FINISHED ||
+  status === EVENT_STATUS.DRAFT || status === EVENT_STATUS.DELETED;
 
 /** True if secondary transfers/resale should be frozen for this state. */
 export const isTransferFrozen = (status) => status === EVENT_STATUS.CANCELED;
@@ -82,8 +83,8 @@ export async function fetchPublicEventStatusMap() {
  * Resolve the effective status for a single on-chain event name (gate scanner).
  * Returns "published" | "finished" | "canceled" | null (null = unmanaged/legacy).
  */
-export async function fetchEventStatusByName(eventName) {
-  const exact = (eventName || "").trim();
+export async function fetchEventStatusByName(eventName, { strict = false } = {}) {
+  const exact = (eventName || "").split(" #")[0].trim();
   if (!exact) return null;
   try {
     const q = query(collection(db, "events"), where("headline", "==", exact));
@@ -98,6 +99,7 @@ export async function fetchEventStatusByName(eventName) {
     return result;
   } catch (e) {
     console.warn("[eventStatus] status-by-name fetch failed:", e?.message);
+    if (strict) throw new Error('Could not verify event status. Check the database connection and try again.', { cause: e });
     return null;
   }
 }

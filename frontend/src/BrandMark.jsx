@@ -1,4 +1,4 @@
-import React, { useId } from "react";
+import { useId } from "react";
 
 // TicketChain brand mark: a ticket interlocked with a chain link.
 // Monochrome — paints in `currentColor`, so it inherits text color

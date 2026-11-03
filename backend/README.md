@@ -1,87 +1,30 @@
-# TicketChain Backend: Privy Authentication Integration
+﻿# TicketChain optional authentication backend
 
-This is the backend server for TicketChain V2, responsible for verifying user identities and securing API endpoints using **Privy JWT Authentication**.
+This Express API verifies Privy access tokens using the application's JWKS keys,
+ES256 signatures, issuer `privy.io`, audience and expiration. The main React
+application does not depend on this server for its core ticket flows.
 
-It utilizes Privy's JSON Web Key Set (JWKS) to fetch public signing keys on the fly and verify access tokens sent by the client.
-
----
-
-## 🚀 Setup & Execution
-
-### 1. Install Dependencies
-Navigate to the `backend` directory and run:
-```bash
-cd backend
-npm install
-```
-
-### 2. Configure Environment Variables
-A `.env` file has been automatically created for you in this directory:
-```env
-PORT=5000
-PRIVY_APP_ID=cmpwse3mr000i0ejp1lre5fy9
-PRIVY_JWKS_URI=https://auth.privy.io/api/v1/apps/cmpwse3mr000i0ejp1lre5fy9/jwks.json
-ALLOWED_ORIGINS=http://localhost:5173
-```
-
-### 3. Run the Server
-Run the development server (with automatic reload on file changes):
-```bash
-npm run dev
-```
-
-Or start the production server:
-```bash
+```sh
+npm ci
 npm start
+# or: npm run dev
+npm test
 ```
 
----
+On a fresh setup, copy `.env.example` to `.env`. The existing environment should
+be preserved. `PORT` defaults to 5000; `ALLOWED_ORIGINS` is a comma-separated list
+of frontend origins. The JWKS URL defaults to the configured `PRIVY_APP_ID`.
 
-## 🔒 How Authentication Works (Frontend ➡️ Backend)
+- `GET /api/health`: public health response.
+- `GET /api/user/profile`: requires `Authorization: Bearer <Privy access token>`.
+  The frontend can obtain that token using `getAccessToken()` from `usePrivy()`.
+  Missing, malformed, expired, wrongly signed or wrongly scoped tokens receive 401.
 
-### Step 1: Extract the Access Token on the Frontend
-In your React code, you can fetch the Privy access token using Privy's `getAccessToken` function from the `usePrivy` hook:
+Tests use locally generated P-256 keys and do not need a real user's token or
+access to Privy. The middleware can be instantiated with `createPrivyTokenVerifier`
+for a controlled key resolver in tests.
 
-```javascript
-import { usePrivy } from '@privy-io/react-auth';
+This is a token-verification service. It does not issue Firebase custom tokens
+or secure direct Firestore access; see [the status report](../docs/PRESENTATION_STATUS.md).
 
-// Inside your React component:
-const { getAccessToken, authenticated } = usePrivy();
-
-const fetchProtectedData = async () => {
-  if (!authenticated) {
-    console.error("User is not authenticated");
-    return;
-  }
-  
-  try {
-    // 1. Fetch the short-lived access token from Privy client
-    const token = await getAccessToken();
-    
-    // 2. Transmit the token via the Authorization header
-    const response = await fetch('http://localhost:5000/api/user/profile', {
-      method: 'GET',
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Content-Type': 'application/json'
-      }
-    });
-    
-    const data = await response.json();
-    console.log("Protected API Response:", data);
-  } catch (error) {
-    console.error("Failed to query backend:", error);
-  }
-};
-```
-
-### Step 2: Signature Validation on the Backend
-When the client request hits the backend:
-1. The `verifyPrivyToken` middleware extracts the token from the HTTP `Authorization` header.
-2. It fetches Privy's public signing keys from `https://auth.privy.io/api/v1/apps/cmpwse3mr000i0ejp1lre5fy9/jwks.json` (caches keys locally to limit external traffic).
-3. It validates that the token:
-   * Is signed using an active Privy public key (`RS256` algorithm).
-   * Has not expired (`exp` claim).
-   * Was issued by Privy (`iss` claim = `privy.io`).
-   * Is intended for your specific app (`aud` claim = `cmpwse3mr000i0ejp1lre5fy9`).
-4. If valid, the decoded payload containing the user's Privy DID (`req.user.sub`) is attached to the request (`req.user`), and execution proceeds to your route handler.
+Specification: [Privy access tokens](https://docs.privy.io/authentication/user-authentication/access-tokens).

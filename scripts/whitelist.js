@@ -1,10 +1,12 @@
 import { ethers } from "ethers";
 import dotenv from "dotenv";
+import { readDeployment } from "./deploymentConfig.js";
 dotenv.config();
 
 async function main() {
-  const organizerAddress = "0x29341e403C8978e065a3BbD57520b12649395CC6";
-  const contractAddress = "0xbbfCDf66052abE994712589336aaEee4F4825CEC";
+  const organizerAddress = process.argv[2] || process.env.ORGANIZER_ADDRESS;
+  if (!ethers.isAddress(organizerAddress)) throw new Error('Usage: node scripts/whitelist.js <organizer-wallet-address>');
+  const contractAddress = readDeployment('sepolia').address;
 
   const rpcUrl = process.env.SEPOLIA_RPC_URL;
   const privateKey = process.env.DEPLOYER_PRIVATE_KEY;
@@ -18,11 +20,16 @@ async function main() {
   const wallet = new ethers.Wallet(privateKey, provider);
 
   const abi = [
+    "function owner() view returns (address)",
     "function whitelistOrganizer(address organizer) public",
     "function whitelistedOrganizers(address organizer) public view returns (bool)"
   ];
 
   const contract = new ethers.Contract(contractAddress, abi, wallet);
+  if (Number((await provider.getNetwork()).chainId) !== 11155111) throw new Error('The RPC must point to Sepolia.');
+  if ((await contract.owner()).toLowerCase() !== wallet.address.toLowerCase()) {
+    throw new Error('The configured deployer key is not the current contract owner. Use the owner wallet in the Admin Console.');
+  }
 
   console.log(`📡 Checking whitelist status for ${organizerAddress}...`);
   const isAlreadyWhitelisted = await contract.whitelistedOrganizers(organizerAddress);
