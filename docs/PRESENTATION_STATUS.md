@@ -2,7 +2,7 @@
 
 ## Current result
 
-Local source checks pass: 30 contract/mint-integration tests, 45 frontend logic tests, 9 backend
+Local source checks pass: 30 contract/mint-integration tests, 49 frontend logic tests, 9 backend
 authentication tests, ESLint and the production/PWA build. The frontend serves at
 http://localhost:5173, and the optional backend health check responds at port 5000.
 The protected backend profile rejects requests without an access token.
@@ -20,9 +20,9 @@ permission error came from rules that expired on 21 September 2026.
 change live database rules, deploy a public contract, or submit NFT transactions
 or uploads. The user reports that the website account access now works.
 
-Browser automation stopped because its safety check could not reliably determine
-the current browser URL. Visual checks, Privy sign-in, actual event publication,
-purchase/resale transactions and camera scans still require a manual rehearsal.
+Native browser inspection now works. The signed-in normal Chrome window shows
+the user's published `SUBANG RUN FESTIVAL` with 50 available tickets. Purchase,
+resale and camera scans still require a manual rehearsal.
 
 ## Repairs
 
@@ -124,11 +124,19 @@ while a publication may need its saved recovery state.
 The first update-button implementation had a reload gap: Workbox's refresh callback
 could be missed after manually discovering a waiting worker or after another tab
 activated it. Clicking sent a message but did not necessarily reload the page.
-`appUpdate.js` now listens directly to activation/state/controller events before
-sending `SKIP_WAITING`, reloads immediately when no update is waiting, and reports
-a retryable timeout instead of silently returning. It cleans up listeners and
-reloads at most once. These paths have focused regression tests based on the
+`appUpdate.js` listens directly to activation/state/controller events before
+sending `SKIP_WAITING` and reloads immediately when no update is waiting. If
+activation stalls, it unregisters only this app's worker before reloading;
+it does not erase browser storage. It cleans up listeners and reloads at most
+once. These paths have focused regression tests based on the
 [service-worker activation lifecycle](https://developer.mozilla.org/en-US/docs/Web/API/ServiceWorker/state).
+
+Native Chrome inspection reproduced an active worker alongside a waiting worker,
+then an activated worker with the old timeout notice still visible. A worker
+state alone does not establish that a newer application is available. Production
+builds now embed an ID and emit `app-version.json`; the notice compares the page's
+ID with that uncached deployment file. A waiting worker for the same build does
+not announce an update. Failed version checks do not invent a newer version.
 
 Publication activity is tracked through the complete Publish/Resume operation.
 The update button is disabled during that work, and activity is checked again

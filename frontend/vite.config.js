@@ -2,10 +2,19 @@ import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import { VitePWA } from 'vite-plugin-pwa'
 
+const appBuildId = Date.now().toString(36)
+
 // https://vite.dev/config/
 export default defineConfig({
+  define: { 'import.meta.env.VITE_APP_BUILD_ID': JSON.stringify(appBuildId) },
   plugins: [
     react(),
+    {
+      name: 'ticketchain-build-version',
+      generateBundle() {
+        this.emitFile({ type: 'asset', fileName: 'app-version.json', source: JSON.stringify({ buildId: appBuildId }) })
+      },
+    },
     VitePWA({
       registerType: 'prompt',
       includeAssets: ['favicon.svg', 'favicon.ico', 'icons.svg'],

@@ -2,27 +2,27 @@ import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { useRegisterSW } from 'virtual:pwa-register/react';
 import { applyAppUpdate } from './appUpdate';
 import { isPublishing, subscribePublishing } from './publicationActivity';
+import { getPublishedBuild } from './appVersion';
 
 export default function AppUpdateNotice() {
   const [registration, setRegistration] = useState(null);
-  const [activatedUpdate, setActivatedUpdate] = useState(false);
+  const [availableBuild, setAvailableBuild] = useState(null);
   const [updating, setUpdating] = useState(false);
   const [error, setError] = useState('');
   const updateInProgress = useRef(false);
   const publishing = useSyncExternalStore(subscribePublishing, isPublishing, () => false);
-  const { needRefresh: [needRefresh, setNeedRefresh] } = useRegisterSW({
+  useRegisterSW({
     immediate: true,
     onRegisteredSW(_url, value) { setRegistration(value || null); },
     onNeedReload() {
-      // Activation alone never reloads a tab. The user's update action owns
-      // the activation listeners and checks publication activity before reload.
-      setActivatedUpdate(true);
+      // A waiting/activated worker is not evidence of a newer app build.
+      // Only the explicit user action below may reload this page.
     },
     onRegisterError(value) { console.warn('App update registration failed:', value); },
   });
 
   useEffect(() => {
-    if (!registration) return;
+    if (!import.meta.env.PROD) return;
     let checking = false;
     let lastChecked = 0;
     let disposed = false;
@@ -31,8 +31,11 @@ export default function AppUpdateNotice() {
       checking = true;
       lastChecked = Date.now();
       try {
-        await registration.update();
-        if (!disposed && registration.waiting) setNeedRefresh(true);
+        const published = await getPublishedBuild();
+        if (!disposed) setAvailableBuild(published === import.meta.env.VITE_APP_BUILD_ID ? null : published);
+        // Updating the local worker is best-effort; it must not block checking
+        // whether the actual deployed app differs from this page.
+        if (registration) void registration.update().catch((value) => console.warn('Worker update check failed:', value));
       } catch (value) { console.warn('App update check failed:', value); }
       finally { checking = false; }
     };
@@ -47,7 +50,7 @@ export default function AppUpdateNotice() {
       window.removeEventListener('focus', onFocus);
       document.removeEventListener('visibilitychange', onFocus);
     };
-  }, [registration, setNeedRefresh]);
+  }, [registration]);
 
   const update = async () => {
     if (updateInProgress.current || isPublishing()) return;
@@ -63,7 +66,7 @@ export default function AppUpdateNotice() {
     } finally { updateInProgress.current = false; }
   };
 
-  if (!needRefresh && !activatedUpdate) return null;
+  if (!availableBuild) return null;
   return (
     <aside role="status" aria-live="polite" className="fixed bottom-4 left-4 right-4 z-50 max-w-md rounded-2xl border border-indigo-200 bg-white p-5 text-slate-900 shadow-xl sm:right-auto">
       <p className="text-sm font-semibold">A newer version of TicketChain is ready</p>

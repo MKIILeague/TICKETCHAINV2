@@ -33,12 +33,12 @@ test('installing updates are awaited and activation/controller events reload onl
   worker.change('activated'); sw.dispatchEvent(new Event('controllerchange'));
   await update; assert.equal(reloads, 1);
 });
-test('a stalled activation gives an error and removes late reload listeners', async () => {
-  const worker = new Worker(), sw = container(); let reloads = 0;
-  await assert.rejects(applyAppUpdate({ registration: { waiting: worker }, serviceWorker: sw,
-    reload: () => reloads++, timeoutMs: 5 }), /taking longer/);
+test('a stalled activation retires only the app worker, reloads and removes late listeners', async () => {
+  const worker = new Worker(), sw = container(); let reloads = 0, retired = 0;
+  await applyAppUpdate({ registration: { waiting: worker, unregister: async () => { retired++; return true; } }, serviceWorker: sw,
+    reload: () => reloads++, timeoutMs: 5 });
   worker.change('activated'); sw.dispatchEvent(new Event('controllerchange'));
-  assert.equal(reloads, 0);
+  assert.equal(reloads, 1); assert.equal(retired, 1);
 });
 test('a publication in progress prevents requesting activation or reloading', async () => {
   const worker = new Worker(); let reloads = 0;
@@ -54,10 +54,10 @@ test('a publication started during activation also prevents reload', async () =>
   await assert.rejects(update, /publishing is in progress/);
   assert.equal(reloads, 0);
 });
-test('a replaced worker returns a retryable error', async () => {
-  const worker = new Worker();
-  const update = applyAppUpdate({ registration: { waiting: worker }, serviceWorker: container(), reload: () => assert.fail('Unexpected reload') });
-  worker.change('redundant'); await assert.rejects(update, /replaced/);
+test('a replaced worker recovers instead of getting stuck in an update loop', async () => {
+  const worker = new Worker(); let reloads = 0;
+  const update = applyAppUpdate({ registration: { waiting: worker, unregister: async () => true }, serviceWorker: container(), reload: () => reloads++ });
+  worker.change('redundant'); await update; assert.equal(reloads, 1);
 });
 test('the real registration can be recovered before the React callback is ready', async () => {
   const worker = new Worker(), sw = container(); let reloads = 0;
@@ -66,11 +66,11 @@ test('the real registration can be recovered before the React callback is ready'
   await Promise.resolve(); worker.change('activated'); await update;
   assert.equal(reloads, 1);
 });
-test('activation messaging failures clean up listeners rather than later refreshing', async () => {
+test('activation messaging failures recover and clean up listeners', async () => {
   const worker = new Worker(); let reloads = 0;
   worker.postMessage = () => { throw new Error('Messaging failed'); };
-  await assert.rejects(applyAppUpdate({ registration: { waiting: worker }, serviceWorker: container(), reload: () => reloads++ }), /Messaging failed/);
-  worker.change('activated'); assert.equal(reloads, 0);
+  await applyAppUpdate({ registration: { waiting: worker, unregister: async () => true }, serviceWorker: container(), reload: () => reloads++ });
+  worker.change('activated'); assert.equal(reloads, 1);
 });
 test('publication tracking remains active until all publishing work finishes', () => {
   const first = beginPublication(), second = beginPublication();

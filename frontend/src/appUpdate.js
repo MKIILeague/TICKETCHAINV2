@@ -1,6 +1,7 @@
-// Apply only after an explicit user click. Workbox's reload callback can be
-// missed when a waiting worker was found manually or activated by another tab.
-export async function applyAppUpdate({ registration, serviceWorker, reload, isBusy = () => false, timeoutMs = 10_000 }) {
+// Apply only after an explicit user click. If activation stalls, retire only
+// this app's worker registration and navigate normally. Login, IndexedDB,
+// localStorage, cached records and mint-recovery journals are never deleted.
+export async function applyAppUpdate({ registration, serviceWorker, reload, isBusy = () => false, timeoutMs = 3_000 }) {
   const ensureIdle = () => {
     if (isBusy()) throw new Error('Ticket publishing is in progress. Finish or stop it before updating.');
   };
@@ -23,6 +24,16 @@ export async function applyAppUpdate({ registration, serviceWorker, reload, isBu
       if (finished) return;
       finished = true; cleanup(); reject(error);
     };
+    const recover = async () => {
+      if (finished) return;
+      finished = true; cleanup();
+      try {
+        ensureIdle();
+        if (current.unregister) await current.unregister();
+        ensureIdle();
+        reload(); resolve();
+      } catch (error) { reject(error); }
+    };
     const complete = () => {
       if (finished) return;
       try { ensureIdle(); } catch (error) { fail(error); return; }
@@ -32,16 +43,16 @@ export async function applyAppUpdate({ registration, serviceWorker, reload, isBu
     const onControllerChange = () => { complete(); };
     const onStateChange = () => {
       if (worker.state === 'activated') { complete(); return; }
-      if (worker.state === 'redundant') { fail(new Error('The update was replaced. Try Update app again.')); return; }
+      if (worker.state === 'redundant') { void recover(); return; }
       if (worker.state === 'installed' && !messageSent) {
         messageSent = true;
-        try { worker.postMessage({ type: 'SKIP_WAITING' }); } catch (error) { fail(error); }
+        try { worker.postMessage({ type: 'SKIP_WAITING' }); } catch { void recover(); }
       }
     };
     // Listen BEFORE sending the message so even immediate activation is caught.
     serviceWorker?.addEventListener('controllerchange', onControllerChange);
     worker.addEventListener('statechange', onStateChange);
-    timer = setTimeout(() => fail(new Error('The update is taking longer than expected. Check your connection and try again.')), timeoutMs);
+    timer = setTimeout(() => { void recover(); }, timeoutMs);
     onStateChange();
   });
 }
