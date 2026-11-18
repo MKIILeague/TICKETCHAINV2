@@ -5,7 +5,7 @@ const notSubmitted = (message, cause) => Object.assign(new Error(message, cause 
 
 // A fresh sender is created for every Publish/Resume action. Approval is never
 // persisted and applies only to this exact event, wallet and remaining supply.
-export function createMintApprovalSender({ contract, record, sendTransaction, signal, waitForReceipt }) {
+export function createMintApprovalSigner({ contract, record, signTransaction, signal }) {
   const request = Object.freeze({ ...record.request });
   const walletAddress = record.walletAddress;
   const provider = contract.runner.provider;
@@ -42,25 +42,32 @@ export function createMintApprovalSender({ contract, record, sendTransaction, si
       }
 
       const remaining = request.quantity - confirmedQuantity;
-      const { hash } = await sendTransaction({
-        from: walletAddress, to: request.contractAddress,
-        data: contract.interface.encodeFunctionData('batchMintTickets', args),
-        value: 0n, chainId: request.chainId, gasLimit: BigInt(gasLimit), nonce: submissionNonce,
-      }, {
-        address: walletAddress,
-        uiOptions: {
-          showWalletUIs: !approved,
-          buttonText: `Publish ${remaining} tickets`,
-          description: `Publish ${remaining} remaining tickets for "${request.eventName}". This confirmation authorizes all remaining mint batches for this event. Each batch pays network gas. You can stop after the current batch.`,
-        },
-      });
-      if (!/^0x[\da-fA-F]{64}$/.test(hash || '')) throw new Error('The wallet did not return a valid transaction hash. Check the wallet before resuming.');
+      let signature;
+      try {
+        const { maxFeePerGas, maxPriorityFeePerGas, gasPrice } = await provider.getFeeData();
+        const fees = maxFeePerGas != null && maxPriorityFeePerGas != null
+          ? { maxFeePerGas, maxPriorityFeePerGas } : { gasPrice };
+        if ((fees.maxFeePerGas ?? fees.gasPrice) == null) throw new Error('Could not estimate Sepolia network fees.');
+        if (signal?.aborted) throw new Error('Publication paused before signing the next batch.');
+        ({ signature } = await signTransaction({
+          from: walletAddress, to: request.contractAddress,
+          data: contract.interface.encodeFunctionData('batchMintTickets', args),
+          value: 0n, chainId: request.chainId, gasLimit: BigInt(gasLimit), nonce: submissionNonce, ...fees,
+        }, {
+          address: walletAddress,
+          uiOptions: {
+            showWalletUIs: !approved,
+            buttonText: `Publish ${remaining} tickets`,
+            description: `Publish ${remaining} remaining tickets for "${request.eventName}". This confirmation authorizes all remaining mint batches for this event. Each batch pays network gas. You can stop after the current batch.`,
+          },
+        }));
+      } catch (error) {
+        // Signing alone cannot submit a transaction.
+        throw notSubmitted(error.shortMessage || error.message || 'Could not sign this mint batch.', error);
+      }
       if (!approved) { firstConfirmed = confirmedQuantity; approved = true; }
       submitted += quantity;
-      return {
-        hash,
-        wait: () => waitForReceipt ? waitForReceipt(hash) : provider.waitForTransaction(hash, 1, 180_000),
-      };
+      return signature;
     } finally { sending = false; }
   };
 }

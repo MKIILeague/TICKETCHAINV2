@@ -1,4 +1,4 @@
-import { createWalletProvider } from "./chainAccess";
+import { createWalletProvider, getReadProvider } from "./chainAccess";
 import { useState, useEffect, useRef, useCallback } from "react";
 import { ethers } from "ethers";
 import {
@@ -18,8 +18,8 @@ import { rm, ethLabel } from "./currency";
 import { readPendingPublish, savePendingPublish, clearPendingPublish } from "./publishRecovery";
 
 import { mintEventBatches } from "./mintBatches";
-import { createMintApprovalSender } from "./mintApproval";
-import { useSendTransaction } from "@privy-io/react-auth";
+import { createMintApprovalSigner } from "./mintApproval";
+import { useSignTransaction } from "@privy-io/react-auth";
 import { beginPublication } from "./publicationActivity";
 
 const CATEGORIES = ["Concert", "Sports", "Theatre", "Conference"];
@@ -38,7 +38,11 @@ function MintProgress({ progress, onStop, stopping }) {
     <div className="space-y-2 text-sm" aria-live="polite">
       <p className="font-semibold">{progress.minted} / {progress.total} tickets confirmed</p>
       <progress aria-label="Tickets minted" value={progress.minted} max={progress.total} className="h-2 w-full accent-indigo-600" />
-      {progress.batchQuantity > 0 && <p>Current batch: {progress.batchQuantity} tickets. Waiting for confirmation on-chain.</p>}
+      {progress.batchQuantity > 0 && <p>Current batch: {progress.batchQuantity} tickets. {{
+        signing: "Waiting for wallet approval.",
+        broadcasting: "Submitting to the network.",
+        confirming: "Waiting for confirmation on-chain.",
+      }[progress.batchStatus]}</p>}
       {onStop && <button onClick={onStop} disabled={stopping} className="rounded-lg border border-current px-3 py-1.5 text-xs font-semibold disabled:opacity-50">{stopping ? 'Stopping after current batch...' : 'Stop after current batch'}</button>}
     </div>
   );
@@ -63,7 +67,7 @@ function formatEventDate(unixSec) {
  *  - Publish     → IPFS metadata → batchMintTickets → mutate status:"published"
  */
 export default function EventWizard({ wallet, walletAddress, orgData, isPaused, onPublished }) {
-  const { sendTransaction } = useSendTransaction();
+  const { signTransaction } = useSignTransaction();
   const oneApproval = wallet?.walletClientType === "privy";
   const [stopping, setStopping] = useState(false);
   const [pendingPublish, setPendingPublish] = useState(() => readPendingPublish(walletAddress));
@@ -253,9 +257,9 @@ export default function EventWizard({ wallet, walletAddress, orgData, isPaused, 
 
   // ── Publish (the heavy web3 pipeline) ──
   const checkpointMint = (record) => {
+    savePendingPublish(record.walletAddress, record);
     recoveryRef.current = record;
     setPendingPublish(record);
-    savePendingPublish(record.walletAddress, record);
   };
 
   const finishPublication = async (record) => {
@@ -272,8 +276,9 @@ export default function EventWizard({ wallet, walletAddress, orgData, isPaused, 
       }
       const signer = await provider.getSigner();
       const contract = new ethers.Contract(record.request.contractAddress, CONTRACT_ABI, signer);
-      const sendBatch = oneApproval ? createMintApprovalSender({ contract, record, sendTransaction, signal: controller.signal }) : undefined;
-      record = await mintEventBatches({ contract, record, save: checkpointMint, onProgress: setMintProgress, signal: controller.signal, sendBatch });
+      const signBatch = oneApproval ? createMintApprovalSigner({ contract, record, signTransaction, signal: controller.signal }) : undefined;
+      const broadcast = (serialized) => getReadProvider(record.request.chainId).send("eth_sendRawTransaction", [serialized]);
+      record = await mintEventBatches({ contract, record, save: checkpointMint, onProgress: setMintProgress, signal: controller.signal, signBatch, broadcast });
     }
     setPhase("sync");
     await updateDoc(doc(db, "events", record.id), record.payload);
@@ -288,11 +293,14 @@ export default function EventWizard({ wallet, walletAddress, orgData, isPaused, 
   const showPublishError = (error) => {
     console.error("Publish failed:", error);
     setPhase("error");
+    setMintProgress(null);
     const record = recoveryRef.current;
     const reason = error.code === "ACTION_REJECTED" ? "You cancelled the wallet confirmation."
       : error.reason || error.info?.error?.message || error.shortMessage || error.message || "Publication failed.";
+    const waitingForHash = record?.submitting && !record.pendingHash;
     setError(record?.request
-      ? reason + " " + record.ticketIds.length + "/" + record.request.quantity + " tickets are confirmed. Resume below to mint only the remainder."
+      ? `${reason} ${record.ticketIds.length}/${record.request.quantity} tickets are confirmed.` +
+        (waitingForHash ? "" : " Resume publication to continue.")
       : record ? "Tickets are already minted. Retry database publication below. " + reason : reason);
     if (record) setView("list");
   };
@@ -308,7 +316,7 @@ export default function EventWizard({ wallet, walletAddress, orgData, isPaused, 
     const releasePublication = beginPublication();
     try {
       let record = pendingForWallet;
-      if (record.request && (record.submitting || record.pendingHash) && recoveryHash.trim()) {
+      if (record.request && !record.signedTransaction && (record.submitting || record.pendingHash) && recoveryHash.trim()) {
         const hash = recoveryHash.trim();
         if (!ethers.isHexString(hash, 32)) throw new Error("Paste a complete transaction hash (0x followed by 64 hex characters).");
         record = { ...record, pendingHash: hash, submitting: false };
@@ -411,8 +419,13 @@ export default function EventWizard({ wallet, walletAddress, orgData, isPaused, 
               ? "Publication in progress: " + pendingForWallet.request.eventName + ". Confirmed batches are saved."
               : "Tickets have already been minted. Finish database publication without minting again."}</p>
             {pendingForWallet.request && <MintProgress progress={mintProgress || { minted: pendingForWallet.ticketIds.length, total: pendingForWallet.request.quantity }} onStop={phase === "chain" ? stopMinting : undefined} stopping={stopping} />}
-            {pendingForWallet.pendingHash && <a href={"https://sepolia.etherscan.io/tx/" + pendingForWallet.pendingHash} target="_blank" rel="noreferrer" className="block underline">View the pending transaction</a>}
-            {(pendingForWallet.submitting || pendingForWallet.pendingHash) && !busy && (
+            {pendingForWallet.request?.chainId === 11155111 && pendingForWallet.pendingHash && (
+              <a href={"https://sepolia.etherscan.io/tx/" + pendingForWallet.pendingHash} target="_blank" rel="noreferrer" className="block underline">View transaction on Sepolia</a>
+            )}
+            {pendingForWallet.request?.chainId === 11155111 && pendingForWallet.submitting && !pendingForWallet.pendingHash && !busy && (
+              <a href={"https://sepolia.etherscan.io/address/" + pendingForWallet.walletAddress} target="_blank" rel="noreferrer" className="block underline">Check wallet activity on Sepolia</a>
+            )}
+            {!pendingForWallet.signedTransaction && (pendingForWallet.submitting || pendingForWallet.pendingHash) && !busy && (
               <label className="block">If the wallet submission was interrupted, paste or correct its transaction hash to check it safely:
                 <input aria-label="Interrupted mint transaction hash" value={recoveryHash} onChange={(e) => setRecoveryHash(e.target.value)} placeholder="0x..." className="mt-2 w-full rounded-lg border border-amber-300 bg-white p-2 font-mono text-xs" />
               </label>

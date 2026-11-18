@@ -1,16 +1,19 @@
 const { expect } = require('chai');
-const { ethers } = require('hardhat');
+const { ethers, network } = require('hardhat');
 
 describe('Resumable event minting', function () {
-  let contract, organizer, buyer, record, mintEventBatches, createMintApprovalSender;
+  let contract, organizer, buyer, record, mintEventBatches, createMintApprovalSigner;
   const budget = 2_000_000n;
+  const broadcast = async (signed) => (await ethers.provider.broadcastTransaction(signed)).hash;
+  let organizerKey;
   before(async function () {
     ({ mintEventBatches } = await import('../frontend/src/mintBatches.js'));
-    ({ createMintApprovalSender } = await import('../frontend/src/mintApproval.js'));
+    ({ createMintApprovalSigner } = await import('../frontend/src/mintApproval.js'));
   });
   beforeEach(async function () {
     const [owner, org, other] = await ethers.getSigners();
     organizer = org; buyer = other;
+    organizerKey = ethers.HDNodeWallet.fromPhrase(network.config.accounts.mnemonic, "", "m/44'/60'/0'/0/1");
     const deployed = await ethers.deployContract('TicketContract', [], owner);
     await deployed.waitForDeployment();
     await deployed.whitelistOrganizer(organizer.address);
@@ -84,6 +87,40 @@ describe('Resumable event minting', function () {
     await expect(mintEventBatches({ contract, record, save: () => {} })).to.be.rejectedWith('submission was interrupted');
     expect(await contract.getNextTicketId()).to.equal(0n);
   });
+  it('recovers an older mined batch by its nonce when the wallet lost its hash', async function () {
+    record.request.quantity = 5;
+    const { tokenURI, priceWei, eventName } = record.request;
+    const tx = await contract.batchMintTickets(organizer.address, tokenURI, priceWei, eventName, 5);
+    await tx.wait();
+    const result = await mintEventBatches({ contract, save: () => {}, record: {
+      ...record, submitting: true, batchQuantity: 5, submissionNonce: tx.nonce,
+    } });
+    expect(result.payload.txHash).to.equal(tx.hash);
+    expect(await contract.getNextTicketId()).to.equal(5n);
+  });
+  it('saves an exact signed batch and retries it after the RPC rejects broadcast', async function () {
+    record.request.quantity = 20;
+    let saved;
+    const signer = (state) => createMintApprovalSigner({ contract, record: state,
+      signTransaction: async (input) => ({ signature: await organizerKey.signTransaction(input) }),
+    });
+    await expect(mintEventBatches({ contract, record, signBatch: signer(record), gasCap: budget,
+      save: (state) => { saved = state; },
+      broadcast: async (signed) => {
+        expect(saved.signedTransaction).to.equal(signed);
+        expect(saved.pendingHash).to.equal(ethers.Transaction.from(signed).hash);
+        throw new Error('Request exceeds defined limit.');
+      },
+    })).to.be.rejectedWith('retry the same transaction');
+    expect(await contract.getNextTicketId()).to.equal(0n);
+    const pendingHash = saved.pendingHash;
+    const result = await mintEventBatches({ contract, record: saved, signBatch: signer(saved),
+      broadcast, gasCap: budget, save: () => {},
+    });
+    expect(result.payload.txHash).to.equal(pendingHash);
+    expect(result.signedTransaction).to.be.null;
+    expect(await contract.getNextTicketId()).to.equal(20n);
+  });
   it('pauses between batches when the organizer leaves and resumes the saved remainder', async function () {
     const controller = new AbortController();
     let saved;
@@ -98,31 +135,29 @@ describe('Resumable event minting', function () {
   });
   it('executes 150 real local-chain mints with one publishing confirmation', async function () {
     const prompts = [];
-    const sendBatch = createMintApprovalSender({ contract, record,
-      sendTransaction: async (input, options) => {
+    const signBatch = createMintApprovalSigner({ contract, record,
+      signTransaction: async (input, options) => {
         prompts.push(options.uiOptions.showWalletUIs);
-        const tx = await organizer.sendTransaction(input);
-        return { hash: tx.hash };
+        return { signature: await organizerKey.signTransaction(input) };
       },
-      waitForReceipt: (hash) => ethers.provider.getTransactionReceipt(hash),
     });
-    await mintEventBatches({ contract, record, sendBatch, gasCap: budget, save: () => {} });
+    await mintEventBatches({ contract, record, signBatch, broadcast, gasCap: budget, save: () => {} });
     expect(await contract.getNextTicketId()).to.equal(150n);
     expect(prompts.filter(Boolean)).to.have.length(1);
     expect(prompts.length).to.be.greaterThan(1);
   });
   it('a stopped one-confirmation run requests fresh approval when resumed', async function () {
     const prompts = [], controller = new AbortController(); let saved;
-    const sender = (state, signal) => createMintApprovalSender({ contract, record: state, signal,
-      sendTransaction: async (input, options) => {
+    const sender = (state, signal) => createMintApprovalSigner({ contract, record: state, signal,
+      signTransaction: async (input, options) => {
         prompts.push(options.uiOptions.showWalletUIs);
-        return { hash: (await organizer.sendTransaction(input)).hash };
-      }, waitForReceipt: (hash) => ethers.provider.getTransactionReceipt(hash),
+        return { signature: await organizerKey.signTransaction(input) };
+      },
     });
-    await expect(mintEventBatches({ contract, record, sendBatch: sender(record, controller.signal), gasCap: budget,
+    await expect(mintEventBatches({ contract, record, broadcast, signBatch: sender(record, controller.signal), gasCap: budget,
       signal: controller.signal, save: (s) => { saved = s; if (s.ticketIds.length) controller.abort(); },
     })).to.be.rejectedWith('Publication paused');
-    await mintEventBatches({ contract, record: saved, sendBatch: sender(saved), gasCap: budget, save: () => {} });
+    await mintEventBatches({ contract, record: saved, broadcast, signBatch: sender(saved), gasCap: budget, save: () => {} });
     expect(await contract.getNextTicketId()).to.equal(150n);
     expect(prompts.filter(Boolean)).to.have.length(2);
   });

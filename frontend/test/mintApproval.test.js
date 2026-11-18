@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { Interface } from 'ethers';
-import { createMintApprovalSender } from '../src/mintApproval.js';
+import { createMintApprovalSigner } from '../src/mintApproval.js';
 
 const wallet = '0x1111111111111111111111111111111111111111';
 const address = '0x2222222222222222222222222222222222222222';
@@ -12,15 +12,15 @@ function setup(overrides = {}) {
   const calls = [];
   const record = { walletAddress: wallet, request: { contractAddress: address, chainId: 11155111,
     tokenURI: 'ipfs://event', eventName: 'Festival', priceWei: '500', quantity: 50 } };
-  const provider = { getNetwork: async () => ({ chainId: 11155111n }), waitForTransaction: async (hash) => ({ hash, status: 1 }) };
+  const provider = { getNetwork: async () => ({ chainId: 11155111n }), getFeeData: async () => ({ gasPrice: 1n }) };
   const contract = { interface: iface, getAddress: async () => address,
     runner: { provider, getAddress: async () => wallet } };
-  const sendTransaction = async (input, options) => {
+  const signTransaction = async (input, options) => {
     calls.push({ input, options });
-    return { hash: '0x' + String(calls.length).padStart(64, '0') };
+    return { signature: '0x' + String(calls.length).padStart(64, '0') };
   };
-  return { calls, record, contract, provider, sendTransaction,
-    sender: createMintApprovalSender({ contract, record, sendTransaction, ...overrides }) };
+  return { calls, record, contract, provider, signTransaction,
+    sender: createMintApprovalSigner({ contract, record, signTransaction, ...overrides }) };
 }
 const batch = (confirmedQuantity = 0, quantity = 13) => ({
   args: [wallet, 'ipfs://event', 500n, 'Festival', quantity],
@@ -47,10 +47,10 @@ test('a fresh Resume operation asks again for the remaining supply', async () =>
 test('a rejected first confirmation does not grant silent approval', async () => {
   const original = setup();
   const flags = [];
-  const sender = createMintApprovalSender({ ...original, sendTransaction: async (_input, options) => {
+  const sender = createMintApprovalSigner({ ...original, signTransaction: async (_input, options) => {
     flags.push(options.uiOptions.showWalletUIs);
     if (flags.length === 1) throw Object.assign(new Error('Rejected'), { code: 'ACTION_REJECTED' });
-    return { hash: '0x' + '1'.repeat(64) };
+    return { signature: '0x' + '1'.repeat(64) };
   } });
   await assert.rejects(sender(batch()), /Rejected/);
   await sender(batch());

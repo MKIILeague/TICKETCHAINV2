@@ -33,6 +33,13 @@ test('gas-limit errors shrink the candidate instead of guessing a limit', async 
   });
   assert.ok(plan.quantity <= 5);
 });
+test('an RPC size limit during estimation falls back to a smaller estimated batch', async () => {
+  const plan = await planMintBatch(20, async (quantity) => {
+    if (quantity > 5) throw new Error('Request exceeds defined limit.');
+    return BigInt(quantity) * 1_000_000n;
+  });
+  assert.deepEqual(plan, { quantity: 3, gasLimit: 3_600_000n });
+});
 test('RPC failure prevents publication instead of generating a fallback gas value', async () => {
   await assert.rejects(planMintBatch(150, async () => { throw new Error('RPC unavailable'); }), /RPC unavailable/);
 });
