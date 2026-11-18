@@ -14,7 +14,7 @@
 // consult these helpers before doing on-chain work.
 
 import { db } from "./firebase";
-import { collection, query, where, getDocs, doc, updateDoc } from "firebase/firestore";
+import { collection, query, where, getDocs, doc, updateDoc, runTransaction } from "firebase/firestore";
 
 export const EVENT_STATUS = {
   DRAFT: "draft",
@@ -119,3 +119,40 @@ export const softDeleteEvent = (id) =>
     deletedAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   });
+
+export function abandonEventPublication(record) {
+  const ref = doc(db, "events", record.id);
+  const now = new Date().toISOString();
+  return runTransaction(db, async (transaction) => {
+    const event = (await transaction.get(ref)).data();
+    if (event?.organiserId?.toLowerCase() !== record.walletAddress.toLowerCase()) {
+      throw new Error("The publication draft could not be verified for this organizer.");
+    }
+    if (event.status === EVENT_STATUS.DELETED && event.abandonedPublication) return;
+    if (event.status !== EVENT_STATUS.DRAFT) throw new Error("Only a draft publication can be abandoned.");
+    transaction.update(ref, {
+      status: EVENT_STATUS.DELETED,
+      deletedAt: now,
+      updatedAt: now,
+      abandonedPublication: {
+        request: record.request,
+        confirmedTicketCount: record.ticketIds.length,
+        txHashes: record.mintTransactions.map(({ hash }) => hash),
+        pendingHash: record.pendingHash ?? null,
+        submissionNonce: record.submissionNonce ?? null,
+        batchQuantity: record.batchQuantity ?? null,
+        submitting: !!record.submitting,
+      },
+    });
+  });
+}
+
+export function publishEventDraft(record) {
+  const ref = doc(db, "events", record.id);
+  return runTransaction(db, async (transaction) => {
+    const event = (await transaction.get(ref)).data();
+    if (event?.status === EVENT_STATUS.PUBLISHED && event.txHash === record.payload.txHash) return;
+    if (event?.status !== EVENT_STATUS.DRAFT) throw new Error("The event draft is no longer available to publish.");
+    transaction.update(ref, record.payload);
+  });
+}

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { planMintBatch, TRANSACTION_GAS_CAP } from '../src/mintBatches.js';
+import { planMintBatch, TRANSACTION_GAS_CAP, waitForMintReceipt } from '../src/mintBatches.js';
 
 test('150-ticket event is planned below the transaction cap using observed Sepolia costs', async () => {
   const estimatedQuantities = [];
@@ -50,4 +50,23 @@ test('real contract reverts are not swallowed by size reduction', async () => {
 });
 test('a single ticket exceeding the cap is rejected', async () => {
   await assert.rejects(planMintBatch(1, async () => TRANSACTION_GAS_CAP), /single ticket cannot fit/);
+});
+
+test('confirmation keeps checking the same hash after a temporary RPC limit', async () => {
+  const hash = '0xexpected';
+  const receipt = { hash, status: 1 };
+  let checks = 0;
+  const provider = { getTransactionReceipt: async (requestedHash) => {
+    assert.equal(requestedHash, hash);
+    if (++checks === 1) throw new Error('Request exceeds defined limit.');
+    return checks === 2 ? null : receipt;
+  } };
+  assert.equal(await waitForMintReceipt(provider, hash, { intervalMs: 1 }), receipt);
+  assert.equal(checks, 3);
+});
+
+test('pausing confirmation preserves the submitted hash for later', async () => {
+  const controller = new AbortController();
+  const provider = { getTransactionReceipt: async () => { controller.abort(); return null; } };
+  await assert.rejects(waitForMintReceipt(provider, '0xpending', { signal: controller.signal, intervalMs: 1 }), /transaction is saved/);
 });

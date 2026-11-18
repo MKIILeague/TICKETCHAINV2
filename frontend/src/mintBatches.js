@@ -28,7 +28,26 @@ export async function planMintBatch(remaining, estimate, gasCap = TRANSACTION_GA
 
 const sameAddress = (a, b) => typeof a === 'string' && typeof b === 'string' && a.toLowerCase() === b.toLowerCase();
 
-export async function mintEventBatches({ contract, record, save, onProgress = () => {}, gasCap = TRANSACTION_GAS_CAP, signal, signBatch, broadcast }) {
+export async function waitForMintReceipt(provider, hash, { signal, timeoutMs = 180_000, intervalMs = 4_000 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  while (!signal?.aborted) {
+    try {
+      const receipt = await provider.getTransactionReceipt(hash);
+      if (receipt) return receipt;
+    } catch (error) {
+      const message = error.info?.error?.message || error.shortMessage || error.message || '';
+      if (!['TIMEOUT', 'SERVER_ERROR', 'NETWORK_ERROR'].includes(error.code) &&
+          !/limit exceeded|exceeds defined limit|too many requests|rate limit|failed to fetch/i.test(message)) throw error;
+    }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(intervalMs, remaining)));
+  }
+  if (signal?.aborted) throw new Error('Publication paused. The submitted transaction is saved for resuming.');
+  throw new Error('Confirmation is taking longer than expected. Resume publication to keep checking the saved transaction.');
+}
+
+export async function mintEventBatches({ contract, record, save, onProgress = () => {}, gasCap = TRANSACTION_GAS_CAP, signal, signBatch, broadcast, recoveryHash }) {
   let state = structuredClone(record);
   const request = state.request;
   if (!request || !Number.isSafeInteger(request.quantity) || request.quantity < 1 ||
@@ -46,9 +65,9 @@ export async function mintEventBatches({ contract, record, save, onProgress = ()
     // never silently discard knowledge of already-confirmed transactions.
     await save(structuredClone(state));
   };
-  const progress = (batchQuantity = 0, batchStatus) => onProgress({
+  const progress = (batchStatus) => onProgress({
     minted: state.ticketIds.length, total: request.quantity,
-    batchNumber: state.mintTransactions.length + 1, batchQuantity, batchStatus,
+    batchStatus,
   });
   const mintArgs = (quantity) => [state.walletAddress, request.tokenURI, BigInt(request.priceWei), request.eventName, quantity];
   const checkActive = () => {
@@ -101,7 +120,7 @@ export async function mintEventBatches({ contract, record, save, onProgress = ()
     const { pendingHash, signedTransaction, batchQuantity, submissionNonce } = state;
     const tx = verifySignedBatch(signedTransaction, batchQuantity, submissionNonce);
     if (tx.hash !== pendingHash) throw new Error('The saved mint transaction hash does not match.');
-    progress(batchQuantity, 'broadcasting');
+    progress('broadcasting');
     try {
       if (await broadcast(signedTransaction) !== pendingHash) throw new Error('The network returned a different transaction hash.');
     } catch {
@@ -110,13 +129,18 @@ export async function mintEventBatches({ contract, record, save, onProgress = ()
         throw new Error('Could not confirm that the network accepted this batch. Resume to check it and retry the same transaction.');
       }
     }
-    progress(batchQuantity, 'confirming');
-    const receipt = await provider.getTransactionReceipt(pendingHash) ??
-      await provider.waitForTransaction(pendingHash, 1, 180_000);
+    progress('confirming');
+    const receipt = await waitForMintReceipt(provider, pendingHash, { signal });
     await settle(receipt, pendingHash);
   };
 
   progress();
+  if (recoveryHash && !state.signedTransaction && (state.submitting || state.pendingHash)) {
+    if (!matchesPendingBatch(await provider.getTransaction(recoveryHash))) {
+      throw new Error('The supplied transaction could not be verified as this event’s batch.');
+    }
+    await checkpoint({ pendingHash: recoveryHash, submitting: false });
+  }
   if (state.submitting && !state.pendingHash) {
     // Older records may only contain the nonce. Locate the block where that
     // nonce was mined, then verify the transaction before trusting its hash.
@@ -142,11 +166,12 @@ export async function mintEventBatches({ contract, record, save, onProgress = ()
     await checkpoint({ pendingHash: recovered.hash, submitting: false });
   }
   if (state.pendingHash) {
-    const receipt = await provider.getTransactionReceipt(state.pendingHash);
-    if (!receipt && state.signedTransaction) {
+    if (state.signedTransaction && !await provider.getTransaction(state.pendingHash).catch(() => null)) {
       checkActive();
       await broadcastSavedBatch();
     } else {
+      progress('confirming');
+      const receipt = await waitForMintReceipt(provider, state.pendingHash, { signal });
       await settle(receipt, state.pendingHash);
     }
   }
@@ -161,7 +186,7 @@ export async function mintEventBatches({ contract, record, save, onProgress = ()
     );
     const submissionNonce = await contract.runner.getNonce('pending');
     checkActive();
-    progress(batch.quantity, 'signing');
+    progress('signing');
     if (signBatch) {
       const signedTransaction = await signBatch({
         args: mintArgs(batch.quantity), gasLimit: batch.gasLimit, submissionNonce, confirmedQuantity: state.ticketIds.length,
@@ -193,9 +218,9 @@ export async function mintEventBatches({ contract, record, save, onProgress = ()
       throw error;
     }
     await checkpoint({ pendingHash: tx.hash, submitting: false, submissionNonce: tx.nonce ?? submissionNonce });
-    progress(batch.quantity, 'confirming');
+    progress('confirming');
     let receipt;
-    try { receipt = await tx.wait(); }
+    try { receipt = await tx.wait(1, 180_000); }
     catch (error) {
       if (error.code === 'TRANSACTION_REPLACED' && error.cancelled) {
         await checkpoint({ pendingHash: null, submitting: false, batchQuantity: null });

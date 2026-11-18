@@ -8,14 +8,14 @@ import {
 } from "lucide-react";
 import { CONTRACT_ABI, getContractAddress } from "./constants";
 import { db } from "./firebase";
-import { collection, addDoc, updateDoc, doc, getDocs, query, where } from "firebase/firestore";
+import { collection, addDoc, updateDoc, doc, getDocFromServer, getDocs, query, where } from "firebase/firestore";
 import {
   uploadFileToIPFS, uploadJSONToIPFS, isIpfsConfigured, ipfsToHttp
 } from "./ipfs";
-import { EVENT_STATUS, effectiveStatus, cancelEvent, softDeleteEvent } from "./eventStatus";
+import { EVENT_STATUS, effectiveStatus, cancelEvent, softDeleteEvent, abandonEventPublication, publishEventDraft } from "./eventStatus";
 import { rm, ethLabel } from "./currency";
 
-import { readPendingPublish, savePendingPublish, clearPendingPublish } from "./publishRecovery";
+import { readPendingPublish, savePendingPublish, clearPendingPublish, withPublicationLock } from "./publishRecovery";
 
 import { mintEventBatches } from "./mintBatches";
 import { createMintApprovalSigner } from "./mintApproval";
@@ -38,12 +38,12 @@ function MintProgress({ progress, onStop, stopping }) {
     <div className="space-y-2 text-sm" aria-live="polite">
       <p className="font-semibold">{progress.minted} / {progress.total} tickets confirmed</p>
       <progress aria-label="Tickets minted" value={progress.minted} max={progress.total} className="h-2 w-full accent-indigo-600" />
-      {progress.batchQuantity > 0 && <p>Current batch: {progress.batchQuantity} tickets. {{
+      {progress.batchStatus && <p>{{
         signing: "Waiting for wallet approval.",
         broadcasting: "Submitting to the network.",
-        confirming: "Waiting for confirmation on-chain.",
+        confirming: "Confirming tickets on-chain. Publication continues automatically.",
       }[progress.batchStatus]}</p>}
-      {onStop && <button onClick={onStop} disabled={stopping} className="rounded-lg border border-current px-3 py-1.5 text-xs font-semibold disabled:opacity-50">{stopping ? 'Stopping after current batch...' : 'Stop after current batch'}</button>}
+      {onStop && <button onClick={onStop} disabled={stopping} className="rounded-lg border border-current px-3 py-1.5 text-xs font-semibold disabled:opacity-50">{stopping ? 'Pausing publication...' : 'Pause publication'}</button>}
     </div>
   );
 }
@@ -71,7 +71,7 @@ export default function EventWizard({ wallet, walletAddress, orgData, isPaused, 
   const oneApproval = wallet?.walletClientType === "privy";
   const [stopping, setStopping] = useState(false);
   const [pendingPublish, setPendingPublish] = useState(() => readPendingPublish(walletAddress));
-  const pendingForWallet = pendingPublish?.walletAddress === walletAddress ? pendingPublish : null;
+  const pendingForWallet = pendingPublish?.walletAddress?.toLowerCase() === walletAddress?.toLowerCase() ? pendingPublish : null;
   const publishLock = useRef(false);
   const recoveryRef = useRef(pendingPublish);
   const mintController = useRef(null);
@@ -172,14 +172,14 @@ export default function EventWizard({ wallet, walletAddress, orgData, isPaused, 
   };
 
   // Full validation (required for Preview & Publish).
-  const validateFull = () => {
+  const validateFull = (now) => {
     if (!form.headline.trim()) return "Add an event title.";
     if (!form.dateTime) return "Pick a date & time.";
     if (!form.category) return "Choose a category.";
     if (!form.venue.trim()) return "Add a venue name & location.";
     if (!posterFile && !currentImageHash) return "Upload an event poster image.";
     const eventTime = new Date(form.dateTime).getTime();
-    if (!Number.isFinite(eventTime) || eventTime <= Date.now()) return "Choose an event date in the future.";
+    if (!Number.isFinite(eventTime) || eventTime <= now) return "Choose an event date in the future.";
     const supply = Number(form.totalSupply);
     if (!Number.isSafeInteger(supply) || supply <= 0) return "Total quantity must be a whole number greater than 0.";
     try { if (ethers.parseEther(form.price) <= 0n) return "Ticket price must be greater than 0."; }
@@ -235,7 +235,7 @@ export default function EventWizard({ wallet, walletAddress, orgData, isPaused, 
   const handleSaveDraft = async ({ goPreview = false } = {}) => {
     if (busy) return;
     if (goPreview) {
-      const v = validateFull();
+      const v = validateFull(Date.now());
       if (v) { setError(v); return; }
     } else if (!form.headline.trim()) {
       setError("Add at least a title to save a draft.");
@@ -262,7 +262,7 @@ export default function EventWizard({ wallet, walletAddress, orgData, isPaused, 
     setPendingPublish(record);
   };
 
-  const finishPublication = async (record) => {
+  const finishPublication = async (record, recoveryHash) => {
     if (record.request && record.stage !== "sync") {
       if (!wallet || !walletAddress) throw new Error("Sign into the original organizer account to resume.");
       setPhase("chain");
@@ -278,10 +278,10 @@ export default function EventWizard({ wallet, walletAddress, orgData, isPaused, 
       const contract = new ethers.Contract(record.request.contractAddress, CONTRACT_ABI, signer);
       const signBatch = oneApproval ? createMintApprovalSigner({ contract, record, signTransaction, signal: controller.signal }) : undefined;
       const broadcast = (serialized) => getReadProvider(record.request.chainId).send("eth_sendRawTransaction", [serialized]);
-      record = await mintEventBatches({ contract, record, save: checkpointMint, onProgress: setMintProgress, signal: controller.signal, signBatch, broadcast });
+      record = await mintEventBatches({ contract, record, save: checkpointMint, onProgress: setMintProgress, signal: controller.signal, signBatch, broadcast, recoveryHash });
     }
     setPhase("sync");
-    await updateDoc(doc(db, "events", record.id), record.payload);
+    await publishEventDraft(record);
     setEvents((previous) => previous.map((event) => event.id === record.id ? { ...event, ...record.payload } : event));
     // A leftover sync-only record is safe to retry: it cannot mint more tickets.
     try { clearPendingPublish(walletAddress); } catch (error) { console.warn("Could not clear recovery storage:", error); }
@@ -310,73 +310,141 @@ export default function EventWizard({ wallet, walletAddress, orgData, isPaused, 
     mintController.current?.abort();
   };
 
+  const latestPublication = (expected) => {
+    const saved = readPendingPublish(expected.walletAddress);
+    if (saved?.id !== expected.id) {
+      setPendingPublish(saved);
+      recoveryRef.current = saved;
+      throw new Error("Publication changed in another tab. Check the current Events list.");
+    }
+    return saved;
+  };
+
   const recoverPublish = async () => {
     if (!pendingForWallet || busy || publishLock.current) return;
-    publishLock.current = true; setError("");
+    publishLock.current = true; setPhase("saving"); setError("");
     const releasePublication = beginPublication();
     try {
-      let record = pendingForWallet;
-      if (record.request && !record.signedTransaction && (record.submitting || record.pendingHash) && recoveryHash.trim()) {
+      await withPublicationLock(walletAddress, async () => {
+        const record = latestPublication(pendingForWallet);
+        if (record.request && record.stage !== "sync") {
+          const event = await getDocFromServer(doc(db, "events", record.id));
+          if (event.data()?.status !== EVENT_STATUS.DRAFT) throw new Error("The event draft is no longer available to resume.");
+        }
         const hash = recoveryHash.trim();
-        if (!ethers.isHexString(hash, 32)) throw new Error("Paste a complete transaction hash (0x followed by 64 hex characters).");
-        record = { ...record, pendingHash: hash, submitting: false };
-        checkpointMint(record);
-      }
-      await finishPublication(record);
+        if (hash && !ethers.isHexString(hash, 32)) throw new Error("Paste a complete transaction hash (0x followed by 64 hex characters).");
+        await finishPublication(record, hash);
+      });
     } catch (error) { showPublishError(error); }
     finally { publishLock.current = false; releasePublication(); }
   };
 
-  const discardPreparation = () => {
-    if (busy || pendingForWallet?.ticketIds?.length || pendingForWallet?.pendingHash || pendingForWallet?.submitting) return;
-    clearPendingPublish(walletAddress); recoveryRef.current = null; setPendingPublish(null);
-    setMintProgress(null); setError(""); setPhase("idle");
+  const discardPreparation = async () => {
+    if (!pendingForWallet || busy || publishLock.current) return;
+    try {
+      await withPublicationLock(walletAddress, () => {
+        const saved = latestPublication(pendingForWallet);
+        if (saved.ticketIds?.length || saved.pendingHash || saved.submitting) throw new Error("This publication already started minting.");
+        clearPendingPublish(walletAddress); recoveryRef.current = null; setPendingPublish(null);
+        setMintProgress(null); setError(""); setPhase("idle");
+      });
+    } catch (error) { showPublishError(error); }
   };
 
-  const handlePublish = async () => {
+  const abandonAndStartOver = async () => {
+    const record = pendingForWallet;
+    if (!record?.request || record.stage === "sync" || busy || publishLock.current) return;
+    if (!window.confirm(`Abandon "${record.request.eventName}" and open a new draft? Any tickets already submitted may still confirm on-chain.`)) return;
+
+    publishLock.current = true;
+    setPhase("saving");
+    setError("");
+    const releasePublication = beginPublication();
+    try {
+      await withPublicationLock(record.walletAddress, async () => {
+        const saved = latestPublication(record);
+        if (saved.stage === "sync") {
+          checkpointMint(saved);
+          throw new Error("All tickets have confirmed. Resume to finish publishing the event.");
+        }
+        await abandonEventPublication(saved);
+        clearPendingPublish(saved.walletAddress);
+      });
+      recoveryRef.current = null;
+      setPendingPublish(null);
+      setRecoveryHash("");
+      setMintProgress(null);
+      setEvents((previous) => previous.filter((event) => event.id !== record.id));
+      setPhase("idle");
+      newEvent();
+    } catch (error) {
+      setPhase("error");
+      setError(error.message || "Couldn't abandon this publication.");
+    } finally {
+      publishLock.current = false;
+      releasePublication();
+    }
+  };
+
+  const handlePublish = async (now) => {
     if (busy || publishLock.current) return;
-    if (pendingForWallet) { await recoverPublish(); return; }
-    const validation = validateFull();
+    if (pendingForWallet) {
+      if (pendingForWallet.id === currentId) await recoverPublish();
+      else {
+        setError("An unfinished publication is already saved. Resume it or abandon it to start over.");
+        setView("list");
+      }
+      return;
+    }
+    const validation = validateFull(now);
     if (validation) { setError(validation); return; }
     if (!wallet || !walletAddress) { setError("Connect your wallet first."); return; }
     publishLock.current = true;
     const releasePublication = beginPublication();
     try {
-      setPhase("ipfs"); setError(""); setMintProgress(null);
-      const { id, imageHash } = await persistDraft();
-      const timestamp = Math.floor(new Date(form.dateTime).getTime() / 1000);
-      const quantity = Number(form.totalSupply);
-      const metadataCid = await uploadJSONToIPFS({
-        name: form.headline.trim(), description: form.description.trim(), image: "ipfs://" + imageHash,
-        attributes: [
-          { trait_type: "Category", value: form.category },
-          { trait_type: "Venue", value: form.venue.trim() },
-          { trait_type: "Event date", value: timestamp, display_type: "date" },
-        ],
-      }, form.headline.trim() + " metadata");
-      const provider = createWalletProvider(await wallet.getEthereumProvider());
-      const currentChain = Number((await provider.getNetwork()).chainId);
-      const chainId = import.meta.env.DEV && currentChain === 31337 ? 31337 : 11155111;
-      const contractAddress = getContractAddress(chainId);
-      const record = {
-        version: 2, walletAddress, id, stage: "minting", ticketIds: [], mintTransactions: [],
-        firstMintBlock: null, pendingHash: null, submitting: false, batchQuantity: null,
-        request: { contractAddress, chainId, quantity, tokenURI: "ipfs://" + metadataCid,
-          priceWei: ethers.parseEther(form.price).toString(), eventName: form.headline.trim() },
-        payload: { status: "published", ipfsHash: metadataCid, contractAddress, chainId, timestamp,
-          aggregateSupply: quantity, priceEth: form.price,
-          publishedAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
-      };
-      // Retain the exact metadata and request before opening the first wallet
-      // prompt. Resuming never repeats completed batches or re-uploads metadata.
-      checkpointMint(record);
-      await finishPublication(record);
+      await withPublicationLock(walletAddress, async () => {
+        const saved = readPendingPublish(walletAddress);
+        if (saved) {
+          setPendingPublish(saved);
+          recoveryRef.current = saved;
+          throw new Error("An unfinished publication is already saved. Open Events to continue.");
+        }
+        setPhase("ipfs"); setError(""); setMintProgress(null);
+        const { id, imageHash } = await persistDraft();
+        const timestamp = Math.floor(new Date(form.dateTime).getTime() / 1000);
+        const quantity = Number(form.totalSupply);
+        const metadataCid = await uploadJSONToIPFS({
+          name: form.headline.trim(), description: form.description.trim(), image: "ipfs://" + imageHash,
+          attributes: [
+            { trait_type: "Category", value: form.category },
+            { trait_type: "Venue", value: form.venue.trim() },
+            { trait_type: "Event date", value: timestamp, display_type: "date" },
+          ],
+        }, form.headline.trim() + " metadata");
+        const provider = createWalletProvider(await wallet.getEthereumProvider());
+        const currentChain = Number((await provider.getNetwork()).chainId);
+        const chainId = import.meta.env.DEV && currentChain === 31337 ? 31337 : 11155111;
+        const contractAddress = getContractAddress(chainId);
+        const record = {
+          version: 2, walletAddress, id, stage: "minting", ticketIds: [], mintTransactions: [],
+          firstMintBlock: null, pendingHash: null, submitting: false, batchQuantity: null,
+          request: { contractAddress, chainId, quantity, tokenURI: "ipfs://" + metadataCid,
+            priceWei: ethers.parseEther(form.price).toString(), eventName: form.headline.trim() },
+          payload: { status: "published", ipfsHash: metadataCid, contractAddress, chainId, timestamp,
+            aggregateSupply: quantity, priceEth: form.price,
+            publishedAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
+        };
+        // Retain the exact metadata and request before opening the first wallet
+        // prompt. Resuming never repeats completed batches or re-uploads metadata.
+        checkpointMint(record);
+        await finishPublication(record);
+      });
     } catch (error) { showPublishError(error); }
     finally { publishLock.current = false; releasePublication(); }
   };
 
   const handleDelete = async (ev) => {
-    if (pendingForWallet?.id === ev.id) { setError("Finish or discard the pending publication before deleting this draft."); return; }
+    if (pendingForWallet?.id === ev.id) { await abandonAndStartOver(); return; }
     if (!window.confirm(`Delete "${ev.headline || "Untitled"}"? It will be removed from your dashboards (kept in our records for audit).`)) return;
     try {
       await softDeleteEvent(ev.id);
@@ -416,7 +484,7 @@ export default function EventWizard({ wallet, walletAddress, orgData, isPaused, 
         {pendingForWallet && (
           <div role="status" className="rounded-xl border border-amber-200 bg-amber-50 p-5 text-sm text-amber-900 space-y-3">
             <p>{pendingForWallet.request
-              ? "Publication in progress: " + pendingForWallet.request.eventName + ". Confirmed batches are saved."
+              ? `${busy ? "Publishing" : "Unfinished publication"}: ${pendingForWallet.request.eventName}`
               : "Tickets have already been minted. Finish database publication without minting again."}</p>
             {pendingForWallet.request && <MintProgress progress={mintProgress || { minted: pendingForWallet.ticketIds.length, total: pendingForWallet.request.quantity }} onStop={phase === "chain" ? stopMinting : undefined} stopping={stopping} />}
             {pendingForWallet.request?.chainId === 11155111 && pendingForWallet.pendingHash && (
@@ -434,6 +502,9 @@ export default function EventWizard({ wallet, walletAddress, orgData, isPaused, 
               <button disabled={busy} onClick={recoverPublish} className="rounded-lg bg-amber-700 px-4 py-2 text-white disabled:opacity-40">{busy ? "Publishing..." : "Resume publication"}</button>
               {pendingForWallet.request && !pendingForWallet.ticketIds.length && !pendingForWallet.pendingHash && !pendingForWallet.submitting && (
                 <button disabled={busy} onClick={discardPreparation} className="rounded-lg border border-amber-400 px-4 py-2 disabled:opacity-40">Discard preparation</button>
+              )}
+              {pendingForWallet.request && pendingForWallet.stage !== "sync" && (
+                <button disabled={busy} onClick={abandonAndStartOver} className="rounded-lg border border-amber-400 px-4 py-2 disabled:opacity-40">Abandon and start over</button>
               )}
             </div>
           </div>
@@ -686,7 +757,7 @@ export default function EventWizard({ wallet, walletAddress, orgData, isPaused, 
           <button onClick={() => setView("edit")} disabled={busy} className="flex-1 py-3 bg-white border border-slate-200 hover:bg-slate-50 disabled:opacity-50 text-slate-700 rounded-xl font-semibold text-sm transition-colors inline-flex items-center justify-center gap-2">
             <Pencil size={16} /> Edit event
           </button>
-          <button onClick={handlePublish} disabled={busy || isPaused} className="flex-1 py-3 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-100 disabled:text-slate-400 text-white rounded-xl font-semibold text-sm transition-colors inline-flex items-center justify-center gap-2">
+          <button onClick={() => handlePublish(Date.now())} disabled={busy || isPaused} className="flex-1 py-3 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-100 disabled:text-slate-400 text-white rounded-xl font-semibold text-sm transition-colors inline-flex items-center justify-center gap-2">
             {busy ? <><RefreshCw size={15} className="animate-spin" /> Publishing…</> : isPaused ? "Transactions paused" : <><Rocket size={16} /> Publish event</>}
           </button>
         </div>
