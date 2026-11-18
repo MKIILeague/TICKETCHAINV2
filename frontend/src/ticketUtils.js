@@ -52,8 +52,8 @@ export function parseTicketQr(raw, deploymentsForChain) {
 
 // Some public RPCs reject long historical ranges. Try the fast path first,
 // then walk bounded windows without flooding the provider with parallel calls.
-export async function queryTicketLogs(contract, filter, startBlock = 0) {
-  const head = await contract.runner.provider.getBlockNumber();
+export async function queryTicketLogs(contract, filter, startBlock = 0, endBlock) {
+  const head = endBlock ?? await contract.runner.provider.getBlockNumber();
   if (startBlock > head) return [];
   try { return await contract.queryFilter(filter, startBlock, head); }
   catch {

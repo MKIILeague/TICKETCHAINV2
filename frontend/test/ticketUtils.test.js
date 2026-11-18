@@ -56,6 +56,13 @@ test('historical logs fall back to bounded non-overlapping windows', async () =>
 test('a deployment beyond the chain head has no logs', async () => {
   assert.deepEqual(await queryTicketLogs({ runner: { provider: { getBlockNumber: async () => 2 } } }, {}, 3), []);
 });
+test('a wallet refresh can keep transfer logs pinned to the ownership snapshot', async () => {
+  const fake = {
+    runner: { provider: { getBlockNumber: () => assert.fail('The wallet already resolved the block') } },
+    queryFilter: async (_filter, from, to) => [from, to],
+  };
+  assert.deepEqual(await queryTicketLogs(fake, {}, 100, 120), [100, 120]);
+});
 test('stalled external requests time out', async () => {
   await assert.rejects(withTimeout(new Promise(() => {}), 5), /timed out/);
   assert.equal(await withTimeout(Promise.resolve('ok'), 1000), 'ok');

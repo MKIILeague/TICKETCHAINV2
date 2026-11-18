@@ -14,7 +14,7 @@
 // consult these helpers before doing on-chain work.
 
 import { db } from "./firebase";
-import { collection, query, where, getDocs, doc, updateDoc, runTransaction } from "firebase/firestore";
+import { collection, query, where, getDocs, getDocsFromServer, doc, updateDoc, runTransaction } from "firebase/firestore";
 
 export const EVENT_STATUS = {
   DRAFT: "draft",
@@ -57,23 +57,25 @@ export const isTransferFrozen = (status) => status === EVENT_STATUS.CANCELED;
  * (anything minted: published or canceled; finished is derived from published).
  * Used by the buyer marketplace + wallet to badge/freeze events.
  */
-export async function fetchPublicEventStatusMap() {
+export async function fetchPublicEventStatusMap({ fresh = false } = {}) {
   try {
     const q = query(
       collection(db, "events"),
       where("status", "in", [EVENT_STATUS.PUBLISHED, EVENT_STATUS.CANCELED])
     );
-    const snap = await getDocs(q);
+    const snap = await (fresh ? getDocsFromServer(q) : getDocs(q));
+    const now = Date.now();
     const map = {};
     snap.forEach((d) => {
       const ev = { id: d.id, ...d.data() };
       const key = normalizeEventName(ev.headline);
-      const eff = effectiveStatus(ev);
+      const eff = effectiveStatus(ev, now);
       const prev = map[key]?.status;
       if (!prev || (RANK[eff] || 0) > (RANK[prev] || 0)) map[key] = { status: eff, ev };
     });
     return map;
   } catch (e) {
+    if (fresh) throw e;
     console.warn("[eventStatus] public map fetch failed:", e?.message);
     return {};
   }
